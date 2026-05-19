@@ -1,7 +1,7 @@
-import { ScrollView, Text, View, TextInput, Pressable, Alert, FlatList } from 'react-native';
+import React, { useState, useEffect } from 'react';
+import { ScrollView, Text, View, TextInput, Pressable, Alert } from 'react-native';
 import { ScreenContainer } from '@/components/screen-container';
 import { useColors } from '@/hooks/use-colors';
-import { useState, useEffect } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 
@@ -53,6 +53,7 @@ const calculatePlannedAmounts = (
   totalAmount: number
 ): Record<string, number> => {
   const total = calculateTotalRation(components);
+  if (total === 0) return {};
   return Object.fromEntries(
     Object.entries(components).map(([key, value]) => [
       key,
@@ -86,9 +87,12 @@ export default function FeedingModeScreen() {
 
   const selectedGroupId = (groupId || 'milchkuehe') as AnimalGroupId;
   const selectedGroup = ANIMAL_GROUPS.find((g) => g.id === selectedGroupId);
-  const [currentRation, setCurrentRation] = React.useState<BaseRation | null>(null);
 
-  React.useEffect(() => {
+  // FIX: war React.useState – React wurde nicht importiert
+  const [currentRation, setCurrentRation] = useState<BaseRation | null>(null);
+
+  // FIX: war React.useEffect – React wurde nicht importiert
+  useEffect(() => {
     const loadRation = async () => {
       try {
         const data = await AsyncStorage.getItem(`ration_${selectedGroupId}`);
@@ -106,8 +110,6 @@ export default function FeedingModeScreen() {
   const [completedComponents, setCompletedComponents] = useState<Set<string>>(new Set());
   const [isStarted, setIsStarted] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-
-
 
   const handleStart = () => {
     if (!isValidAmount(totalAmount)) {
@@ -146,7 +148,6 @@ export default function FeedingModeScreen() {
       (id) => !completedComponents.has(id) && id !== componentId
     );
 
-    // Adjust remaining components
     const adjusted = adjustPlannedAmounts(
       plannedAmounts,
       componentId,
@@ -154,8 +155,6 @@ export default function FeedingModeScreen() {
       remainingComponents
     );
     setPlannedAmounts(adjusted);
-
-    // Mark as completed
     setCompletedComponents((prev) => new Set([...prev, componentId]));
   };
 
@@ -188,9 +187,7 @@ export default function FeedingModeScreen() {
       Alert.alert('Erfolg', 'Fütterung gespeichert!', [
         {
           text: 'OK',
-          onPress: () => {
-            router.back();
-          },
+          onPress: () => router.back(),
         },
       ]);
     } catch (error) {
@@ -206,7 +203,6 @@ export default function FeedingModeScreen() {
       <ScreenContainer className="p-6">
         <ScrollView contentContainerStyle={{ flexGrow: 1 }}>
           <View className="flex-1 gap-6 justify-center">
-            {/* Header */}
             <View className="items-center gap-2 mb-4">
               <Text className="text-3xl font-bold text-foreground">Fütterung</Text>
               <Text className="text-base text-muted text-center">
@@ -214,7 +210,6 @@ export default function FeedingModeScreen() {
               </Text>
             </View>
 
-            {/* Total Amount Input */}
             <View className="gap-3">
               <Text className="text-sm font-semibold text-foreground">
                 Gewünschte Gesamtmenge (kg)
@@ -235,7 +230,6 @@ export default function FeedingModeScreen() {
               </View>
             </View>
 
-            {/* Current Ration Info */}
             {currentRation && (
               <View className="p-4 bg-primary/10 rounded-lg border border-primary/20 gap-2">
                 <Text className="text-xs font-semibold text-foreground uppercase">
@@ -250,7 +244,6 @@ export default function FeedingModeScreen() {
               </View>
             )}
 
-            {/* Start Button */}
             <Pressable
               onPress={handleStart}
               style={({ pressed }) => [
@@ -267,7 +260,6 @@ export default function FeedingModeScreen() {
               </Text>
             </Pressable>
 
-            {/* Back Button */}
             <Pressable
               onPress={() => router.back()}
               style={({ pressed }) => [
@@ -289,16 +281,10 @@ export default function FeedingModeScreen() {
     );
   }
 
-  // Feeding in progress
-  const remainingComponents = FEEDING_COMPONENTS.filter(
-    (c) => !completedComponents.has(c.id)
-  );
-
   return (
     <ScreenContainer className="p-6">
       <ScrollView contentContainerStyle={{ flexGrow: 1 }}>
         <View className="flex-1 gap-4">
-          {/* Header */}
           <View className="gap-1 mb-2">
             <Text className="text-2xl font-bold text-foreground">Fütterung läuft</Text>
             <Text className="text-sm text-muted">
@@ -306,7 +292,6 @@ export default function FeedingModeScreen() {
             </Text>
           </View>
 
-          {/* Progress */}
           <View className="gap-2 p-3 bg-primary/10 rounded-lg">
             <View className="flex-row justify-between items-center">
               <Text className="text-sm font-semibold text-foreground">Fortschritt</Text>
@@ -327,7 +312,6 @@ export default function FeedingModeScreen() {
             </View>
           </View>
 
-          {/* Components List */}
           <View className="gap-3">
             {FEEDING_COMPONENTS.map((comp) => {
               const isCompleted = completedComponents.has(comp.id);
@@ -356,11 +340,9 @@ export default function FeedingModeScreen() {
                       )}
                     </View>
 
-                    <View className="gap-1">
-                      <Text className="text-xs text-muted">
-                        Sollmenge: {formatAmount(planned)} kg
-                      </Text>
-                    </View>
+                    <Text className="text-xs text-muted">
+                      Sollmenge: {formatAmount(planned)} kg
+                    </Text>
 
                     {!isCompleted && (
                       <View className="gap-2 mt-2">
@@ -374,9 +356,7 @@ export default function FeedingModeScreen() {
                             placeholderTextColor={colors.muted}
                             keyboardType="decimal-pad"
                             value={actual}
-                            onChangeText={(value) =>
-                              handleComponentInput(comp.id, value)
-                            }
+                            onChangeText={(value) => handleComponentInput(comp.id, value)}
                           />
                           <Text className="text-sm text-muted">kg</Text>
                         </View>
@@ -404,7 +384,6 @@ export default function FeedingModeScreen() {
             })}
           </View>
 
-          {/* Save Button */}
           {completedComponents.size === FEEDING_COMPONENTS.length && (
             <Pressable
               onPress={handleSave}
