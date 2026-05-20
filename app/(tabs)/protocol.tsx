@@ -4,11 +4,20 @@ import { ScreenContainer } from '@/components/screen-container';
 import { useColors } from '@/hooks/use-colors';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const ANIMAL_GROUPS = [
+const DEFAULT_ANIMAL_GROUPS = [
   { id: 'milchkuehe', name: 'Milchkühe' },
   { id: 'fresser', name: 'Fresser' },
   { id: 'bullen', name: 'Bullen' },
 ];
+
+const DEFAULT_COMPONENT_NAMES: Record<string, string> = {
+  maissilage: 'Maissilage',
+  grassilage: 'Grassilage',
+  stroh: 'Stroh',
+  ausgleichsfutter: 'Ausgleichsfutter',
+  kraftfutter: 'Kraftfutter',
+  wasser: 'Wasser',
+};
 
 const TIME_RANGES = [
   { id: '7', label: '7 Tage' },
@@ -19,108 +28,117 @@ const TIME_RANGES = [
 
 const formatDate = (timestamp: number) => {
   const date = new Date(timestamp);
-  return date.toLocaleDateString('de-DE', {
-    day: '2-digit',
-    month: '2-digit',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
+  return date.toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
 };
 
-const getGroupName = (groupId: string) =>
-  ANIMAL_GROUPS.find((g) => g.id === groupId)?.name || groupId;
+const GROUPS_KEY = 'app:animal_groups';
 
 export default function ProtocolScreen() {
   const colors = useColors();
+  const [animalGroups, setAnimalGroups] = useState(DEFAULT_ANIMAL_GROUPS);
   const [selectedGroupId, setSelectedGroupId] = useState<string>('all');
   const [selectedTimeRange, setSelectedTimeRange] = useState<string>('30');
   const [allLogs, setAllLogs] = useState<any[]>([]);
   const [filteredLogs, setFilteredLogs] = useState<any[]>([]);
   const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
+  const [componentNameMap, setComponentNameMap] = useState<Record<string, string>>(DEFAULT_COMPONENT_NAMES);
 
-  const loadAllLogs = async () => {
+  const getGroupName = (groupId: string) => animalGroups.find((g) => g.id === groupId)?.name || groupId;
+  const getComponentName = (id: string) => componentNameMap[id] || id;
+
+  const loadData = async () => {
     try {
-      const groups = ['milchkuehe', 'fresser', 'bullen'];
+      const groupData = await AsyncStorage.getItem(GROUPS_KEY);
+      const groups = groupData ? JSON.parse(groupData) : DEFAULT_ANIMAL_GROUPS;
+      setAnimalGroups(groups);
+
+      const rationData = await AsyncStorage.getItem('feeding:base_rations');
+      const nameMap: Record<string, string> = { ...DEFAULT_COMPONENT_NAMES };
+      if (rationData) {
+        const rations = JSON.parse(rationData);
+        Object.values(rations).forEach((ration: any) => {
+          if (ration.componentDefs) {
+            ration.componentDefs.forEach((comp: any) => { nameMap[comp.id] = comp.name; });
+          }
+        });
+      }
+      setComponentNameMap(nameMap);
+
       let combined: any[] = [];
-      for (const groupId of groups) {
-        const data = await AsyncStorage.getItem(`logs_${groupId}`);
-        if (data) {
-          const logs = JSON.parse(data);
-          combined = [...combined, ...logs];
-        }
+      for (const group of groups) {
+        const data = await AsyncStorage.getItem(`logs_${group.id}`);
+        if (data) combined = [...combined, ...JSON.parse(data)];
       }
       combined.sort((a, b) => b.timestamp - a.timestamp);
       setAllLogs(combined);
-    } catch (error) {
-      console.error('Error loading logs:', error);
-    }
+    } catch (error) { console.error('Error loading data:', error); }
   };
 
-  useEffect(() => {
-    loadAllLogs();
-  }, []);
+  useEffect(() => { loadData(); }, []);
 
   useEffect(() => {
     let logs = allLogs;
-    if (selectedGroupId !== 'all') {
-      logs = logs.filter((log) => log.animalGroupId === selectedGroupId);
-    }
+    if (selectedGroupId !== 'all') logs = logs.filter((log) => log.animalGroupId === selectedGroupId);
     if (selectedTimeRange !== 'all') {
-      const days = parseInt(selectedTimeRange);
-      const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+      const cutoff = Date.now() - parseInt(selectedTimeRange) * 24 * 60 * 60 * 1000;
       logs = logs.filter((log) => log.timestamp >= cutoff);
     }
     setFilteredLogs(logs);
   }, [allLogs, selectedGroupId, selectedTimeRange]);
+
+  const handleDeleteLog = (log: any) => {
+    Alert.alert('Fütterung löschen', `Fütterung vom ${formatDate(log.timestamp)} wirklich löschen?`, [
+      { text: 'Abbrechen', style: 'cancel' },
+      { text: 'Löschen', style: 'destructive', onPress: async () => {
+        try {
+          const data = await AsyncStorage.getItem(`logs_${log.animalGroupId}`);
+          if (data) {
+            const logs = JSON.parse(data);
+            await AsyncStorage.setItem(`logs_${log.animalGroupId}`, JSON.stringify(logs.filter((l: any) => l.id !== log.id)));
+          }
+          setAllLogs((prev) => prev.filter((l) => l.id !== log.id));
+          if (expandedLogId === log.id) setExpandedLogId(null);
+        } catch { Alert.alert('Fehler', 'Eintrag konnte nicht gelöscht werden'); }
+      }},
+    ]);
+  };
 
   const stats = React.useMemo(() => {
     if (filteredLogs.length === 0) return null;
     const totalFeedings = filteredLogs.length;
     const totalAmount = filteredLogs.reduce((sum, log) => sum + (log.totalAmount || 0), 0);
     const avgAmount = totalAmount / totalFeedings;
-
     const componentKeys = new Set<string>();
-    filteredLogs.forEach((log) => {
-      Object.keys(log.actualAmounts || {}).forEach((k) => componentKeys.add(k));
-    });
-
-    const componentStats: Record<string, { name: string; avgActual: number; avgPlanned: number; avgDeviation: number; count: number }> = {};
+    filteredLogs.forEach((log) => Object.keys(log.actualAmounts || {}).forEach((k) => componentKeys.add(k)));
+    const componentStats: Record<string, { avgActual: number; avgPlanned: number; avgDeviation: number }> = {};
     componentKeys.forEach((key) => {
-      const entries = filteredLogs.filter(
-        (log) => log.actualAmounts?.[key] !== undefined && log.plannedAmounts?.[key] !== undefined
-      );
+      const entries = filteredLogs.filter((log) => log.actualAmounts?.[key] !== undefined && log.plannedAmounts?.[key] !== undefined);
       if (entries.length === 0) return;
       const avgActual = entries.reduce((sum, log) => sum + (log.actualAmounts[key] || 0), 0) / entries.length;
       const avgPlanned = entries.reduce((sum, log) => sum + (log.plannedAmounts[key] || 0), 0) / entries.length;
-      componentStats[key] = { name: key, avgActual, avgPlanned, avgDeviation: avgActual - avgPlanned, count: entries.length };
+      componentStats[key] = { avgActual, avgPlanned, avgDeviation: avgActual - avgPlanned };
     });
-
     return { totalFeedings, totalAmount, avgAmount, componentStats };
   }, [filteredLogs]);
 
   const handleExportCSV = async () => {
     try {
+      const allKeys = Array.from(new Set(filteredLogs.flatMap((log) => Object.keys(log.actualAmounts || {}))));
       let csv = 'Datum,Tiergruppe,Gesamtmenge (kg)';
-      const allKeys = new Set<string>();
-      filteredLogs.forEach((log) => Object.keys(log.actualAmounts || {}).forEach((k) => allKeys.add(k)));
-      const keys = Array.from(allKeys);
-      keys.forEach((k) => { csv += `,${k} Soll (kg),${k} Ist (kg),${k} Abw. (kg)`; });
+      allKeys.forEach((k) => { csv += `,${getComponentName(k)} Soll,${getComponentName(k)} Ist,${getComponentName(k)} Abw.`; });
       csv += '\n';
       for (const log of filteredLogs) {
         csv += `${formatDate(log.timestamp)},${getGroupName(log.animalGroupId)},${log.totalAmount.toFixed(2)}`;
-        keys.forEach((k) => {
-          const planned = (log.plannedAmounts?.[k] || 0).toFixed(2);
-          const actual = (log.actualAmounts?.[k] || 0).toFixed(2);
-          const dev = ((log.actualAmounts?.[k] || 0) - (log.plannedAmounts?.[k] || 0)).toFixed(2);
-          csv += `,${planned},${actual},${dev}`;
+        allKeys.forEach((k) => {
+          const p = (log.plannedAmounts?.[k] || 0).toFixed(2);
+          const a = (log.actualAmounts?.[k] || 0).toFixed(2);
+          const d = ((log.actualAmounts?.[k] || 0) - (log.plannedAmounts?.[k] || 0)).toFixed(2);
+          csv += `,${p},${a},${d}`;
         });
         csv += '\n';
       }
       await Share.share({ message: csv, title: 'FutterRation_Protokoll.csv' });
-    } catch (error) {
-      Alert.alert('Fehler', 'Export fehlgeschlagen');
-    }
+    } catch { Alert.alert('Fehler', 'Export fehlgeschlagen'); }
   };
 
   return (
@@ -132,56 +150,27 @@ export default function ProtocolScreen() {
             <Text className="text-sm text-muted text-center">Übersicht aller Fütterungen</Text>
           </View>
 
-          {/* Group Filter */}
           <View className="gap-2">
             <Text className="text-xs font-semibold text-muted uppercase">Tiergruppe</Text>
             <ScrollView horizontal showsHorizontalScrollIndicator={false}>
               <View className="flex-row gap-2">
-                {[{ id: 'all', name: 'Alle' }, ...ANIMAL_GROUPS].map((group) => (
-                  <Pressable
-                    key={group.id}
-                    onPress={() => setSelectedGroupId(group.id)}
-                    style={({ pressed }) => [{
-                      backgroundColor: selectedGroupId === group.id ? colors.primary : colors.surface,
-                      borderColor: colors.border,
-                      borderWidth: 1,
-                      borderRadius: 8,
-                      paddingHorizontal: 14,
-                      paddingVertical: 8,
-                      opacity: pressed ? 0.8 : 1,
-                    }]}
-                  >
-                    <Text className={selectedGroupId === group.id ? 'font-semibold text-background text-sm' : 'font-medium text-foreground text-sm'}>
-                      {group.name}
-                    </Text>
+                {[{ id: 'all', name: 'Alle' }, ...animalGroups].map((group) => (
+                  <Pressable key={group.id} onPress={() => setSelectedGroupId(group.id)}
+                    style={({ pressed }) => [{ backgroundColor: selectedGroupId === group.id ? colors.primary : colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 8, opacity: pressed ? 0.8 : 1 }]}>
+                    <Text className={selectedGroupId === group.id ? 'font-semibold text-background text-sm' : 'font-medium text-foreground text-sm'}>{group.name}</Text>
                   </Pressable>
                 ))}
               </View>
             </ScrollView>
           </View>
 
-          {/* Time Range Filter */}
           <View className="gap-2">
             <Text className="text-xs font-semibold text-muted uppercase">Zeitraum</Text>
             <View className="flex-row gap-2">
               {TIME_RANGES.map((range) => (
-                <Pressable
-                  key={range.id}
-                  onPress={() => setSelectedTimeRange(range.id)}
-                  style={({ pressed }) => [{
-                    flex: 1,
-                    backgroundColor: selectedTimeRange === range.id ? colors.primary : colors.surface,
-                    borderColor: colors.border,
-                    borderWidth: 1,
-                    borderRadius: 8,
-                    paddingVertical: 8,
-                    alignItems: 'center',
-                    opacity: pressed ? 0.8 : 1,
-                  }]}
-                >
-                  <Text className={selectedTimeRange === range.id ? 'font-semibold text-background text-xs' : 'font-medium text-foreground text-xs'}>
-                    {range.label}
-                  </Text>
+                <Pressable key={range.id} onPress={() => setSelectedTimeRange(range.id)}
+                  style={({ pressed }) => [{ flex: 1, backgroundColor: selectedTimeRange === range.id ? colors.primary : colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: 8, paddingVertical: 8, alignItems: 'center', opacity: pressed ? 0.8 : 1 }]}>
+                  <Text className={selectedTimeRange === range.id ? 'font-semibold text-background text-xs' : 'font-medium text-foreground text-xs'}>{range.label}</Text>
                 </Pressable>
               ))}
             </View>
@@ -190,29 +179,24 @@ export default function ProtocolScreen() {
           {filteredLogs.length === 0 ? (
             <View className="flex-1 items-center justify-center gap-3 py-12">
               <Text className="text-lg font-semibold text-foreground">Keine Einträge</Text>
-              <Text className="text-sm text-muted text-center">
-                Für diesen Zeitraum wurden keine Fütterungen gefunden.
-              </Text>
+              <Text className="text-sm text-muted text-center">Für diesen Zeitraum wurden keine Fütterungen gefunden.</Text>
             </View>
           ) : (
             <>
-              {/* Summary Stats */}
               {stats && (
                 <View className="gap-3">
                   <Text className="text-xs font-semibold text-muted uppercase">Zusammenfassung</Text>
                   <View className="flex-row gap-3">
-                    <View className="flex-1 p-3 bg-primary/10 rounded-lg border border-primary/20 items-center">
-                      <Text className="text-2xl font-bold text-primary">{stats.totalFeedings}</Text>
-                      <Text className="text-xs text-muted text-center">Fütterungen</Text>
-                    </View>
-                    <View className="flex-1 p-3 bg-primary/10 rounded-lg border border-primary/20 items-center">
-                      <Text className="text-2xl font-bold text-primary">{stats.totalAmount.toFixed(0)}</Text>
-                      <Text className="text-xs text-muted text-center">kg gesamt</Text>
-                    </View>
-                    <View className="flex-1 p-3 bg-primary/10 rounded-lg border border-primary/20 items-center">
-                      <Text className="text-2xl font-bold text-primary">{stats.avgAmount.toFixed(0)}</Text>
-                      <Text className="text-xs text-muted text-center">kg Ø/Fütterung</Text>
-                    </View>
+                    {[
+                      { value: stats.totalFeedings.toString(), label: 'Fütterungen' },
+                      { value: stats.totalAmount.toFixed(0), label: 'kg gesamt' },
+                      { value: stats.avgAmount.toFixed(0), label: 'kg Ø/Fütterung' },
+                    ].map((s) => (
+                      <View key={s.label} className="flex-1 p-3 bg-primary/10 rounded-lg border border-primary/20 items-center">
+                        <Text className="text-2xl font-bold text-primary">{s.value}</Text>
+                        <Text className="text-xs text-muted text-center">{s.label}</Text>
+                      </View>
+                    ))}
                   </View>
 
                   {Object.keys(stats.componentStats).length > 0 && (
@@ -226,15 +210,15 @@ export default function ProtocolScreen() {
                           <Text className="w-20 text-xs font-bold text-foreground text-right">Ø Abw.</Text>
                         </View>
                         {Object.entries(stats.componentStats).map(([key, s]) => {
-                          const isPositive = s.avgDeviation > 0.05;
-                          const isNegative = s.avgDeviation < -0.05;
+                          const isPos = s.avgDeviation > 0.05;
+                          const isNeg = s.avgDeviation < -0.05;
                           return (
                             <View key={key} className="flex-row px-3 py-2" style={{ borderTopWidth: 1, borderTopColor: colors.border }}>
-                              <Text className="flex-1 text-xs text-foreground" numberOfLines={1}>{s.name}</Text>
+                              <Text className="flex-1 text-xs text-foreground" numberOfLines={1}>{getComponentName(key)}</Text>
                               <Text className="w-20 text-xs text-muted text-right">{s.avgPlanned.toFixed(1)} kg</Text>
                               <Text className="w-20 text-xs text-foreground text-right">{s.avgActual.toFixed(1)} kg</Text>
-                              <Text className="w-20 text-xs font-semibold text-right" style={{ color: isPositive ? '#f97316' : isNegative ? '#3b82f6' : colors.success }}>
-                                {isPositive ? '+' : ''}{s.avgDeviation.toFixed(1)} kg
+                              <Text className="w-20 text-xs font-semibold text-right" style={{ color: isPos ? '#f97316' : isNeg ? '#3b82f6' : colors.success }}>
+                                {isPos ? '+' : ''}{s.avgDeviation.toFixed(1)} kg
                               </Text>
                             </View>
                           );
@@ -245,81 +229,68 @@ export default function ProtocolScreen() {
                 </View>
               )}
 
-              {/* Export */}
-              <Pressable
-                onPress={handleExportCSV}
-                style={({ pressed }) => [{
-                  backgroundColor: colors.surface,
-                  borderColor: colors.primary,
-                  borderWidth: 1,
-                  borderRadius: 8,
-                  padding: 12,
-                  opacity: pressed ? 0.8 : 1,
-                }]}
-              >
-                <Text className="text-center font-semibold text-primary">
-                  📥 CSV exportieren ({filteredLogs.length} Einträge)
-                </Text>
+              <Pressable onPress={handleExportCSV}
+                style={({ pressed }) => [{ backgroundColor: colors.surface, borderColor: colors.primary, borderWidth: 1, borderRadius: 8, padding: 12, opacity: pressed ? 0.8 : 1 }]}>
+                <Text className="text-center font-semibold text-primary">📥 CSV exportieren ({filteredLogs.length} Einträge)</Text>
               </Pressable>
 
-              {/* Log Entries */}
               <View className="gap-2">
                 <Text className="text-xs font-semibold text-muted uppercase">Einträge ({filteredLogs.length})</Text>
                 {filteredLogs.map((log) => {
                   const isExpanded = expandedLogId === log.id;
                   const componentKeys = Object.keys(log.actualAmounts || {});
                   return (
-                    <Pressable
-                      key={log.id}
-                      onPress={() => setExpandedLogId(isExpanded ? null : log.id)}
-                      style={({ pressed }) => [{
-                        backgroundColor: colors.surface,
-                        borderColor: colors.border,
-                        borderWidth: 1,
-                        borderRadius: 8,
-                        padding: 12,
-                        opacity: pressed ? 0.9 : 1,
-                      }]}
-                    >
-                      <View className="flex-row justify-between items-start">
-                        <View className="gap-1">
-                          <Text className="text-sm font-semibold text-foreground">{getGroupName(log.animalGroupId)}</Text>
-                          <Text className="text-xs text-muted">{formatDate(log.timestamp)}</Text>
-                        </View>
-                        <View className="items-end gap-1">
-                          <Text className="text-sm font-bold text-foreground">{log.totalAmount.toFixed(1)} kg</Text>
-                          <Text className="text-xs text-muted">{isExpanded ? '▲ zuklappen' : '▼ Details'}</Text>
-                        </View>
-                      </View>
-
-                      {isExpanded && componentKeys.length > 0 && (
-                        <View className="mt-3 pt-3" style={{ borderTopWidth: 1, borderTopColor: colors.border }}>
-                          <View className="flex-row mb-1">
-                            <Text className="flex-1 text-xs font-bold text-muted">Komponente</Text>
-                            <Text className="w-20 text-xs font-bold text-muted text-right">Soll</Text>
-                            <Text className="w-20 text-xs font-bold text-muted text-right">Ist</Text>
-                            <Text className="w-16 text-xs font-bold text-muted text-right">Abw.</Text>
+                    <View key={log.id} className="bg-surface rounded-lg border border-border overflow-hidden" style={{ borderColor: colors.border }}>
+                      <Pressable onPress={() => setExpandedLogId(isExpanded ? null : log.id)}
+                        style={({ pressed }) => [{ padding: 12, opacity: pressed ? 0.9 : 1 }]}>
+                        <View className="flex-row justify-between items-start">
+                          <View className="gap-1 flex-1">
+                            <Text className="text-sm font-semibold text-foreground">{getGroupName(log.animalGroupId)}</Text>
+                            <Text className="text-xs text-muted">{formatDate(log.timestamp)}</Text>
                           </View>
-                          {componentKeys.map((key) => {
-                            const planned = log.plannedAmounts?.[key] || 0;
-                            const actual = log.actualAmounts?.[key] || 0;
-                            const dev = actual - planned;
-                            const isPos = dev > 0.05;
-                            const isNeg = dev < -0.05;
-                            return (
-                              <View key={key} className="flex-row py-1" style={{ borderTopWidth: 1, borderTopColor: colors.border }}>
-                                <Text className="flex-1 text-xs text-foreground" numberOfLines={1}>{key}</Text>
-                                <Text className="w-20 text-xs text-muted text-right">{planned.toFixed(1)} kg</Text>
-                                <Text className="w-20 text-xs text-foreground text-right">{actual.toFixed(1)} kg</Text>
-                                <Text className="w-16 text-xs font-medium text-right" style={{ color: isPos ? '#f97316' : isNeg ? '#3b82f6' : colors.success }}>
-                                  {isPos ? '+' : ''}{dev.toFixed(1)}
-                                </Text>
+                          <View className="items-end gap-1">
+                            <Text className="text-sm font-bold text-foreground">{log.totalAmount.toFixed(1)} kg</Text>
+                            <Text className="text-xs text-muted">{isExpanded ? '▲ zuklappen' : '▼ Details'}</Text>
+                          </View>
+                        </View>
+                      </Pressable>
+
+                      {isExpanded && (
+                        <View className="px-3 pb-3" style={{ borderTopWidth: 1, borderTopColor: colors.border }}>
+                          {componentKeys.length > 0 && (
+                            <>
+                              <View className="flex-row py-2">
+                                <Text className="flex-1 text-xs font-bold text-muted">Komponente</Text>
+                                <Text className="w-20 text-xs font-bold text-muted text-right">Soll</Text>
+                                <Text className="w-20 text-xs font-bold text-muted text-right">Ist</Text>
+                                <Text className="w-16 text-xs font-bold text-muted text-right">Abw.</Text>
                               </View>
-                            );
-                          })}
+                              {componentKeys.map((key) => {
+                                const planned = log.plannedAmounts?.[key] || 0;
+                                const actual = log.actualAmounts?.[key] || 0;
+                                const dev = actual - planned;
+                                const isPos = dev > 0.05;
+                                const isNeg = dev < -0.05;
+                                return (
+                                  <View key={key} className="flex-row py-1" style={{ borderTopWidth: 1, borderTopColor: colors.border }}>
+                                    <Text className="flex-1 text-xs text-foreground" numberOfLines={1}>{getComponentName(key)}</Text>
+                                    <Text className="w-20 text-xs text-muted text-right">{planned.toFixed(1)} kg</Text>
+                                    <Text className="w-20 text-xs text-foreground text-right">{actual.toFixed(1)} kg</Text>
+                                    <Text className="w-16 text-xs font-medium text-right" style={{ color: isPos ? '#f97316' : isNeg ? '#3b82f6' : colors.success }}>
+                                      {isPos ? '+' : ''}{dev.toFixed(1)}
+                                    </Text>
+                                  </View>
+                                );
+                              })}
+                            </>
+                          )}
+                          <Pressable onPress={() => handleDeleteLog(log)}
+                            style={({ pressed }) => [{ marginTop: 12, backgroundColor: colors.surface, borderColor: '#ef4444', borderWidth: 1, borderRadius: 8, padding: 10, opacity: pressed ? 0.7 : 1 }]}>
+                            <Text className="text-center text-xs font-semibold" style={{ color: '#ef4444' }}>🗑 Fütterung löschen</Text>
+                          </Pressable>
                         </View>
                       )}
-                    </Pressable>
+                    </View>
                   );
                 })}
               </View>
