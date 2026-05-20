@@ -41,8 +41,8 @@ const env = {
 const config: ExpoConfig = {
   name: env.appName,
   slug: env.appSlug,
-  version: "1.0.2",
-  runtimeVersion: "1.0.2",
+  version: "1.0.3",
+  runtimeVersion: "1.0.3",
   orientation: "portrait",
   icon: "./assets/images/icon.png",
   scheme: env.scheme,
@@ -55,7 +55,7 @@ const config: ExpoConfig = {
   },
   ios: {
     supportsTablet: true,
-    buildNumber: "3",
+    buildNumber: "4",
     bundleIdentifier: env.iosBundleId,
     "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
