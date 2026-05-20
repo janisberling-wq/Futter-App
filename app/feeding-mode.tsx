@@ -88,15 +88,16 @@ export default function FeedingModeScreen() {
   const selectedGroupId = (groupId || 'milchkuehe') as AnimalGroupId;
   const selectedGroup = ANIMAL_GROUPS.find((g) => g.id === selectedGroupId);
 
-  // FIX: war React.useState – React wurde nicht importiert
   const [currentRation, setCurrentRation] = useState<BaseRation | null>(null);
 
-  // FIX: war React.useEffect – React wurde nicht importiert
   useEffect(() => {
     const loadRation = async () => {
       try {
-        const data = await AsyncStorage.getItem(`ration_${selectedGroupId}`);
-        if (data) setCurrentRation(JSON.parse(data));
+        const data = await AsyncStorage.getItem('feeding:base_rations');
+        if (data) {
+          const rations = JSON.parse(data);
+          setCurrentRation(rations[selectedGroupId] || null);
+        }
       } catch (error) {
         console.error('Error loading ration:', error);
       }
@@ -238,172 +239,4 @@ export default function FeedingModeScreen() {
                 <Text className="text-sm text-foreground">
                   Summe:{' '}
                   <Text className="font-semibold">
-                    {formatAmount(calculateTotalRation(currentRation.components))} kg
-                  </Text>
-                </Text>
-              </View>
-            )}
-
-            <Pressable
-              onPress={handleStart}
-              style={({ pressed }) => [
-                {
-                  backgroundColor: colors.primary,
-                  borderRadius: 8,
-                  padding: 16,
-                  opacity: pressed ? 0.8 : 1,
-                },
-              ]}
-            >
-              <Text className="text-center font-semibold text-background text-base">
-                Fütterung starten
-              </Text>
-            </Pressable>
-
-            <Pressable
-              onPress={() => router.back()}
-              style={({ pressed }) => [
-                {
-                  backgroundColor: colors.surface,
-                  borderColor: colors.border,
-                  borderWidth: 1,
-                  borderRadius: 8,
-                  padding: 12,
-                  opacity: pressed ? 0.8 : 1,
-                },
-              ]}
-            >
-              <Text className="text-center font-medium text-foreground">Zurück</Text>
-            </Pressable>
-          </View>
-        </ScrollView>
-      </ScreenContainer>
-    );
-  }
-
-  return (
-    <ScreenContainer className="p-6">
-      <ScrollView contentContainerStyle={{ flexGrow: 1 }}>
-        <View className="flex-1 gap-4">
-          <View className="gap-1 mb-2">
-            <Text className="text-2xl font-bold text-foreground">Fütterung läuft</Text>
-            <Text className="text-sm text-muted">
-              {selectedGroup?.name} • {totalAmount} kg
-            </Text>
-          </View>
-
-          <View className="gap-2 p-3 bg-primary/10 rounded-lg">
-            <View className="flex-row justify-between items-center">
-              <Text className="text-sm font-semibold text-foreground">Fortschritt</Text>
-              <Text className="text-sm font-semibold text-primary">
-                {completedComponents.size} / {FEEDING_COMPONENTS.length}
-              </Text>
-            </View>
-            <View
-              className="h-2 bg-surface rounded-full overflow-hidden"
-              style={{ backgroundColor: colors.surface }}
-            >
-              <View
-                className="h-full bg-primary"
-                style={{
-                  width: `${(completedComponents.size / FEEDING_COMPONENTS.length) * 100}%`,
-                }}
-              />
-            </View>
-          </View>
-
-          <View className="gap-3">
-            {FEEDING_COMPONENTS.map((comp) => {
-              const isCompleted = completedComponents.has(comp.id);
-              const planned = plannedAmounts[comp.id] || 0;
-              const actual = actualAmounts[comp.id] || '';
-
-              return (
-                <View
-                  key={comp.id}
-                  className={`p-4 rounded-lg border ${
-                    isCompleted
-                      ? 'bg-success/10 border-success/30'
-                      : 'bg-surface border-border'
-                  }`}
-                  style={{
-                    borderColor: isCompleted ? colors.success : colors.border,
-                  }}
-                >
-                  <View className="gap-2">
-                    <View className="flex-row justify-between items-start">
-                      <Text className="text-sm font-semibold text-foreground">
-                        {comp.name}
-                      </Text>
-                      {isCompleted && (
-                        <Text className="text-xs font-semibold text-success">✓ Fertig</Text>
-                      )}
-                    </View>
-
-                    <Text className="text-xs text-muted">
-                      Sollmenge: {formatAmount(planned)} kg
-                    </Text>
-
-                    {!isCompleted && (
-                      <View className="gap-2 mt-2">
-                        <View
-                          className="flex-row items-center gap-2 px-3 py-2 bg-background rounded border border-border"
-                          style={{ borderColor: colors.border }}
-                        >
-                          <TextInput
-                            className="flex-1 text-foreground text-base"
-                            placeholder="0.00"
-                            placeholderTextColor={colors.muted}
-                            keyboardType="decimal-pad"
-                            value={actual}
-                            onChangeText={(value) => handleComponentInput(comp.id, value)}
-                          />
-                          <Text className="text-sm text-muted">kg</Text>
-                        </View>
-
-                        <Pressable
-                          onPress={() => handleComponentComplete(comp.id)}
-                          style={({ pressed }) => [
-                            {
-                              backgroundColor: colors.primary,
-                              borderRadius: 6,
-                              padding: 8,
-                              opacity: pressed ? 0.8 : 1,
-                            },
-                          ]}
-                        >
-                          <Text className="text-center font-medium text-background text-sm">
-                            Bestätigen
-                          </Text>
-                        </Pressable>
-                      </View>
-                    )}
-                  </View>
-                </View>
-              );
-            })}
-          </View>
-
-          {completedComponents.size === FEEDING_COMPONENTS.length && (
-            <Pressable
-              onPress={handleSave}
-              disabled={isSaving}
-              style={({ pressed }) => [
-                {
-                  backgroundColor: colors.success,
-                  borderRadius: 8,
-                  padding: 16,
-                  opacity: pressed || isSaving ? 0.8 : 1,
-                },
-              ]}
-            >
-              <Text className="text-center font-semibold text-background text-base">
-                {isSaving ? 'Speichert...' : 'Fütterung abschließen'}
-              </Text>
-            </Pressable>
-          )}
-        </View>
-      </ScrollView>
-    </ScreenContainer>
-  );
-}
+                    {formatAmount(calculateTotal
