@@ -49,6 +49,13 @@ export default function TabLayout() {
           tabBarIcon: ({ color }) => <IconSymbol size={28} name="doc.text" color={color} />,
         }}
       />
+<Tabs.Screen
+  name="verbrauch"
+  options={{
+    title: "Verbrauch",
+    tabBarIcon: ({ color }) => <IconSymbol size={28} name="chart.bar.fill" color={color} />,
+  }}
+/>
     </Tabs>
   );
 }

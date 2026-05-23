@@ -5,7 +5,7 @@ import { useColors } from '@/hooks/use-colors';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 
-type AnimalGroupId = 'milchkuehe' | 'fresser' | 'bullen';
+type AnimalGroupId = string;
 
 interface FeedingComponent {
   id: string;
@@ -30,9 +30,9 @@ interface FeedingSession {
 }
 
 const ANIMAL_GROUPS = [
-  { id: 'milchkuehe' as AnimalGroupId, name: 'Milchkühe' },
-  { id: 'fresser' as AnimalGroupId, name: 'Fresser' },
-  { id: 'bullen' as AnimalGroupId, name: 'Bullen' },
+  { id: 'milchkuehe', name: 'Milchkühe' },
+  { id: 'fresser', name: 'Fresser' },
+  { id: 'bullen', name: 'Bullen' },
 ];
 
 const DEFAULT_FEEDING_COMPONENTS: FeedingComponent[] = [
@@ -44,6 +44,8 @@ const DEFAULT_FEEDING_COMPONENTS: FeedingComponent[] = [
   { id: 'wasser', name: 'Wasser' },
 ];
 
+const GROUPS_KEY = 'app:animal_groups';
+
 const parseAmount = (value: string): number => parseFloat(value.replace(',', '.')) || 0;
 const formatAmount = (value: number): string => value.toFixed(2);
 const isValidNumber = (value: string): boolean => !isNaN(parseFloat(value.replace(',', '.')));
@@ -52,16 +54,28 @@ const calculateTotalRation = (components: Record<string, number>): number =>
 const generateId = (): string => Date.now().toString();
 
 const calculatePlannedAmounts = (
-  components: Record<string, number>,
+  baseComponents: Record<string, number>,
   totalAmount: number
 ): Record<string, number> => {
-  const total = calculateTotalRation(components);
+  const total = calculateTotalRation(baseComponents);
   if (total === 0) return {};
   return Object.fromEntries(
-    Object.entries(components).map(([key, value]) => [
-      key,
-      (value / total) * totalAmount,
-    ])
+    Object.entries(baseComponents).map(([key, value]) => [key, (value / total) * totalAmount])
+  );
+};
+
+// Recalculate remaining components based on ratio implied by actual amount loaded
+const recalculateFromActual = (
+  baseRatios: Record<string, number>,
+  completedId: string,
+  actualAmount: number,
+  remainingIds: string[]
+): Record<string, number> => {
+  const componentRatio = baseRatios[completedId] || 0;
+  if (componentRatio === 0) return {};
+  const impliedTotal = actualAmount / componentRatio;
+  return Object.fromEntries(
+    remainingIds.map((id) => [id, (baseRatios[id] || 0) * impliedTotal])
   );
 };
 
@@ -70,16 +84,21 @@ export default function FeedingModeScreen() {
   const router = useRouter();
   const { groupId } = useLocalSearchParams<{ groupId: string }>();
 
-  const selectedGroupId = (groupId || 'milchkuehe') as AnimalGroupId;
-  const selectedGroup = ANIMAL_GROUPS.find((g) => g.id === selectedGroupId);
+  const selectedGroupId = groupId || 'milchkuehe';
+  const [allGroups, setAllGroups] = useState(ANIMAL_GROUPS);
+  const selectedGroup = allGroups.find((g) => g.id === selectedGroupId);
 
   const [currentRation, setCurrentRation] = useState<BaseRation | null>(null);
   const [activeComponents, setActiveComponents] = useState<FeedingComponent[]>([]);
   const [orderedComponents, setOrderedComponents] = useState<FeedingComponent[]>([]);
+  const [baseRatios, setBaseRatios] = useState<Record<string, number>>({});
 
   useEffect(() => {
-    const loadRation = async () => {
+    const load = async () => {
       try {
+        const groupData = await AsyncStorage.getItem(GROUPS_KEY);
+        if (groupData) setAllGroups(JSON.parse(groupData));
+
         const data = await AsyncStorage.getItem('feeding:base_rations');
         if (data) {
           const rations = JSON.parse(data);
@@ -90,13 +109,17 @@ export default function FeedingModeScreen() {
             const active = defs.filter((c: FeedingComponent) => (ration.components[c.id] || 0) > 0);
             setActiveComponents(active);
             setOrderedComponents(active);
+            const total = calculateTotalRation(ration.components);
+            const ratios: Record<string, number> = {};
+            for (const comp of active) {
+              ratios[comp.id] = total > 0 ? (ration.components[comp.id] || 0) / total : 0;
+            }
+            setBaseRatios(ratios);
           }
         }
-      } catch (error) {
-        console.error('Error loading ration:', error);
-      }
+      } catch (error) { console.error('Error loading ration:', error); }
     };
-    loadRation();
+    load();
   }, [selectedGroupId]);
 
   const [totalAmount, setTotalAmount] = useState('');
@@ -116,25 +139,15 @@ export default function FeedingModeScreen() {
   };
 
   const handleStart = () => {
-    if (!isValidNumber(totalAmount)) {
-      Alert.alert('Fehler', 'Bitte gib eine gültige Gesamtmenge ein');
-      return;
-    }
-    if (!currentRation) {
-      Alert.alert('Fehler', 'Grundration nicht gefunden');
-      return;
-    }
-    if (orderedComponents.length === 0) {
-      Alert.alert('Fehler', 'Keine Komponenten mit Menge > 0 gefunden');
-      return;
-    }
+    if (!isValidNumber(totalAmount)) { Alert.alert('Fehler', 'Bitte gib eine gültige Gesamtmenge ein'); return; }
+    if (!currentRation) { Alert.alert('Fehler', 'Grundration nicht gefunden'); return; }
+    if (orderedComponents.length === 0) { Alert.alert('Fehler', 'Keine Komponenten mit Menge > 0 gefunden'); return; }
 
     const total = parseAmount(totalAmount);
     const activeRationComponents = Object.fromEntries(
       orderedComponents.map((c) => [c.id, currentRation.components[c.id] || 0])
     );
-    const planned = calculatePlannedAmounts(activeRationComponents, total);
-    setPlannedAmounts(planned);
+    setPlannedAmounts(calculatePlannedAmounts(activeRationComponents, total));
     setActualAmounts({});
     setScaleInputs({});
     setCompletedComponents([]);
@@ -144,22 +157,16 @@ export default function FeedingModeScreen() {
   const getCumulativeTarget = (componentId: string): number => {
     const index = orderedComponents.findIndex((c) => c.id === componentId);
     let sum = 0;
-    for (let i = 0; i <= index; i++) {
-      sum += plannedAmounts[orderedComponents[i].id] || 0;
-    }
+    for (let i = 0; i <= index; i++) sum += plannedAmounts[orderedComponents[i].id] || 0;
     return sum;
   };
 
-  const getCumulativeActual = (): number => {
-    return completedComponents.reduce((sum, id) => sum + (actualAmounts[id] || 0), 0);
-  };
+  const getCumulativeActual = (): number =>
+    completedComponents.reduce((sum, id) => sum + (actualAmounts[id] || 0), 0);
 
   const handleComponentComplete = (componentId: string) => {
     const scaleValue = scaleInputs[componentId] || '';
-    if (!isValidNumber(scaleValue)) {
-      Alert.alert('Fehler', 'Bitte gib einen gültigen Waagenwert ein');
-      return;
-    }
+    if (!isValidNumber(scaleValue)) { Alert.alert('Fehler', 'Bitte gib einen gültigen Waagenwert ein'); return; }
 
     const scaleReading = parseAmount(scaleValue);
     const previousCumulative = getCumulativeActual();
@@ -170,22 +177,14 @@ export default function FeedingModeScreen() {
       return;
     }
 
-    const planned = plannedAmounts[componentId];
-    const deviation = actualAmount - planned;
-
     const remainingIds = orderedComponents
       .map((c) => c.id)
       .filter((id) => !completedComponents.includes(id) && id !== componentId);
 
-    const totalRemaining = remainingIds.reduce((sum, id) => sum + (plannedAmounts[id] || 0), 0);
-
-    if (remainingIds.length > 0 && totalRemaining > 0) {
-      const updated = { ...plannedAmounts };
-      for (const id of remainingIds) {
-        const share = (plannedAmounts[id] || 0) / totalRemaining;
-        updated[id] = Math.max(0, (plannedAmounts[id] || 0) - deviation * share);
-      }
-      setPlannedAmounts(updated);
+    // Recalculate remaining based on implied total from actual amount and base ratio
+    if (remainingIds.length > 0 && baseRatios[componentId] > 0) {
+      const newAmounts = recalculateFromActual(baseRatios, componentId, actualAmount, remainingIds);
+      setPlannedAmounts((prev) => ({ ...prev, ...newAmounts }));
     }
 
     setActualAmounts((prev) => ({ ...prev, [componentId]: actualAmount }));
@@ -193,38 +192,22 @@ export default function FeedingModeScreen() {
   };
 
   const handleSave = async () => {
-    if (completedComponents.length !== orderedComponents.length) {
-      Alert.alert('Fehler', 'Bitte füttere alle Komponenten');
-      return;
-    }
-
+    if (completedComponents.length !== orderedComponents.length) { Alert.alert('Fehler', 'Bitte füttere alle Komponenten'); return; }
     setIsSaving(true);
     try {
+      const finalTotal = getCumulativeActual();
       const session: FeedingSession = {
-        id: generateId(),
-        animalGroupId: selectedGroupId,
-        timestamp: Date.now(),
-        totalAmount: parseAmount(totalAmount),
-        plannedAmounts,
-        actualAmounts,
-        completed: true,
+        id: generateId(), animalGroupId: selectedGroupId, timestamp: Date.now(),
+        totalAmount: finalTotal, plannedAmounts, actualAmounts, completed: true,
       };
-
       const logs = await AsyncStorage.getItem(`logs_${selectedGroupId}`);
       const existingLogs = logs ? JSON.parse(logs) : [];
-      await AsyncStorage.setItem(
-        `logs_${selectedGroupId}`,
-        JSON.stringify([...existingLogs, session])
-      );
-      Alert.alert('Erfolg', 'Fütterung gespeichert!', [
+      await AsyncStorage.setItem(`logs_${selectedGroupId}`, JSON.stringify([...existingLogs, session]));
+      Alert.alert('Erfolg', `Fütterung gespeichert! Gesamt: ${formatAmount(finalTotal)} kg`, [
         { text: 'OK', onPress: () => router.back() },
       ]);
-    } catch (error) {
-      Alert.alert('Fehler', 'Fütterung konnte nicht gespeichert werden');
-      console.error(error);
-    } finally {
-      setIsSaving(false);
-    }
+    } catch { Alert.alert('Fehler', 'Fütterung konnte nicht gespeichert werden'); }
+    finally { setIsSaving(false); }
   };
 
   if (!isStarted) {
@@ -238,13 +221,8 @@ export default function FeedingModeScreen() {
             </View>
 
             <View className="gap-3">
-              <Text className="text-sm font-semibold text-foreground">
-                Gewünschte Gesamtmenge (kg)
-              </Text>
-              <View
-                className="flex-row items-center gap-2 px-4 py-3 bg-surface rounded-lg border border-border"
-                style={{ borderColor: colors.border }}
-              >
+              <Text className="text-sm font-semibold text-foreground">Gewünschte Gesamtmenge (kg)</Text>
+              <View className="flex-row items-center gap-2 px-4 py-3 bg-surface rounded-lg border border-border" style={{ borderColor: colors.border }}>
                 <TextInput
                   className="flex-1 text-foreground text-lg font-semibold"
                   placeholder="z.B. 500"
@@ -257,60 +235,26 @@ export default function FeedingModeScreen() {
               </View>
             </View>
 
-            {/* Reihenfolge anpassen */}
             {orderedComponents.length > 0 && (
               <View className="gap-3">
-                <Text className="text-sm font-semibold text-foreground">
-                  Ladereihenfolge anpassen
-                </Text>
+                <Text className="text-sm font-semibold text-foreground">Ladereihenfolge anpassen</Text>
                 <View className="gap-2">
                   {orderedComponents.map((comp, index) => (
-                    <View
-                      key={comp.id}
-                      className="flex-row items-center gap-2 p-3 bg-surface rounded-lg border border-border"
-                      style={{ borderColor: colors.border }}
-                    >
-                      <View
-                        className="w-6 h-6 rounded-full items-center justify-center"
-                        style={{ backgroundColor: colors.primary }}
-                      >
+                    <View key={comp.id} className="flex-row items-center gap-2 p-3 bg-surface rounded-lg border border-border" style={{ borderColor: colors.border }}>
+                      <View className="w-6 h-6 rounded-full items-center justify-center" style={{ backgroundColor: colors.primary }}>
                         <Text className="text-xs font-bold text-background">{index + 1}</Text>
                       </View>
                       <Text className="flex-1 text-sm font-medium text-foreground">{comp.name}</Text>
                       {currentRation && (
-                        <Text className="text-xs text-muted mr-2">
-                          {formatAmount(currentRation.components[comp.id] || 0)} kg
-                        </Text>
+                        <Text className="text-xs text-muted mr-2">{formatAmount(currentRation.components[comp.id] || 0)} kg</Text>
                       )}
                       <View className="flex-row gap-1">
-                        <Pressable
-                          onPress={() => moveComponent(index, 'up')}
-                          disabled={index === 0}
-                          style={({ pressed }) => [{
-                            backgroundColor: index === 0 ? colors.surface : colors.primary,
-                            borderRadius: 4,
-                            width: 28,
-                            height: 28,
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            opacity: pressed ? 0.7 : 1,
-                          }]}
-                        >
+                        <Pressable onPress={() => moveComponent(index, 'up')} disabled={index === 0}
+                          style={({ pressed }) => [{ backgroundColor: index === 0 ? colors.surface : colors.primary, borderRadius: 4, width: 28, height: 28, alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.7 : 1 }]}>
                           <Text style={{ color: index === 0 ? colors.muted : colors.background, fontSize: 14, fontWeight: 'bold' }}>↑</Text>
                         </Pressable>
-                        <Pressable
-                          onPress={() => moveComponent(index, 'down')}
-                          disabled={index === orderedComponents.length - 1}
-                          style={({ pressed }) => [{
-                            backgroundColor: index === orderedComponents.length - 1 ? colors.surface : colors.primary,
-                            borderRadius: 4,
-                            width: 28,
-                            height: 28,
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            opacity: pressed ? 0.7 : 1,
-                          }]}
-                        >
+                        <Pressable onPress={() => moveComponent(index, 'down')} disabled={index === orderedComponents.length - 1}
+                          style={({ pressed }) => [{ backgroundColor: index === orderedComponents.length - 1 ? colors.surface : colors.primary, borderRadius: 4, width: 28, height: 28, alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.7 : 1 }]}>
                           <Text style={{ color: index === orderedComponents.length - 1 ? colors.muted : colors.background, fontSize: 14, fontWeight: 'bold' }}>↓</Text>
                         </Pressable>
                       </View>
@@ -322,33 +266,19 @@ export default function FeedingModeScreen() {
 
             {currentRation && orderedComponents.length > 0 && (
               <View className="p-4 bg-primary/10 rounded-lg border border-primary/20 gap-2">
-                <Text className="text-xs font-semibold text-foreground uppercase">
-                  Grundration pro Tier
-                </Text>
+                <Text className="text-xs font-semibold text-foreground uppercase">Grundration pro Tier</Text>
                 <Text className="text-sm text-foreground">
-                  Summe:{' '}
-                  <Text className="font-semibold">
-                    {formatAmount(calculateTotalRation(
-                      Object.fromEntries(orderedComponents.map((c) => [c.id, currentRation.components[c.id] || 0]))
-                    ))} kg
+                  Summe: <Text className="font-semibold">
+                    {formatAmount(calculateTotalRation(Object.fromEntries(orderedComponents.map((c) => [c.id, currentRation.components[c.id] || 0]))))} kg
                   </Text>
                 </Text>
               </View>
             )}
 
-            <Pressable
-              onPress={handleStart}
-              style={({ pressed }) => [{ backgroundColor: colors.primary, borderRadius: 8, padding: 16, opacity: pressed ? 0.8 : 1 }]}
-            >
-              <Text className="text-center font-semibold text-background text-base">
-                Fütterung starten
-              </Text>
+            <Pressable onPress={handleStart} style={({ pressed }) => [{ backgroundColor: colors.primary, borderRadius: 8, padding: 16, opacity: pressed ? 0.8 : 1 }]}>
+              <Text className="text-center font-semibold text-background text-base">Fütterung starten</Text>
             </Pressable>
-
-            <Pressable
-              onPress={() => router.back()}
-              style={({ pressed }) => [{ backgroundColor: colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: 8, padding: 12, opacity: pressed ? 0.8 : 1 }]}
-            >
+            <Pressable onPress={() => router.back()} style={({ pressed }) => [{ backgroundColor: colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: 8, padding: 12, opacity: pressed ? 0.8 : 1 }]}>
               <Text className="text-center font-medium text-foreground">Zurück</Text>
             </Pressable>
           </View>
@@ -367,29 +297,21 @@ export default function FeedingModeScreen() {
         <View className="flex-1 gap-4">
           <View className="gap-1 mb-2">
             <Text className="text-2xl font-bold text-foreground">Fütterung läuft</Text>
-            <Text className="text-sm text-muted">{selectedGroup?.name} • {totalAmount} kg</Text>
+            <Text className="text-sm text-muted">{selectedGroup?.name} • Ziel: {totalAmount} kg</Text>
           </View>
 
           <View className="gap-2 p-3 bg-primary/10 rounded-lg">
             <View className="flex-row justify-between items-center">
               <Text className="text-sm font-semibold text-foreground">Fortschritt</Text>
-              <Text className="text-sm font-semibold text-primary">
-                {completedComponents.length} / {orderedComponents.length}
-              </Text>
+              <Text className="text-sm font-semibold text-primary">{completedComponents.length} / {orderedComponents.length}</Text>
             </View>
             <View className="h-2 bg-surface rounded-full overflow-hidden" style={{ backgroundColor: colors.surface }}>
-              <View
-                className="h-full bg-primary"
-                style={{ width: `${(completedComponents.length / orderedComponents.length) * 100}%` }}
-              />
+              <View className="h-full bg-primary" style={{ width: `${(completedComponents.length / orderedComponents.length) * 100}%` }} />
             </View>
           </View>
 
           {currentComponent && (
-            <View
-              className="p-4 rounded-lg border-2"
-              style={{ borderColor: colors.primary, backgroundColor: colors.surface }}
-            >
+            <View className="p-4 rounded-lg border-2" style={{ borderColor: colors.primary, backgroundColor: colors.surface }}>
               <Text className="text-xs font-semibold text-primary uppercase mb-3">Jetzt laden</Text>
               <Text className="text-lg font-bold text-foreground mb-1">{currentComponent.name}</Text>
 
@@ -413,28 +335,21 @@ export default function FeedingModeScreen() {
                 </View>
               </View>
 
-              <View
-                className="flex-row items-center gap-2 px-3 py-3 bg-background rounded-lg border"
-                style={{ borderColor: colors.primary }}
-              >
+              <View className="flex-row items-center gap-2 px-3 py-3 bg-background rounded-lg border" style={{ borderColor: colors.primary }}>
                 <TextInput
                   className="flex-1 text-foreground text-xl font-bold"
                   placeholder={formatAmount(cumulativeTarget)}
                   placeholderTextColor={colors.muted}
                   keyboardType="decimal-pad"
                   value={scaleInputs[currentComponent.id] || ''}
-                  onChangeText={(value) =>
-                    setScaleInputs((prev) => ({ ...prev, [currentComponent.id]: value }))
-                  }
+                  onChangeText={(value) => setScaleInputs((prev) => ({ ...prev, [currentComponent.id]: value }))}
                 />
                 <Text className="text-base text-muted font-medium">kg</Text>
               </View>
               <Text className="text-xs text-muted mt-1">Gib den aktuellen Waagenstand ein</Text>
 
-              <Pressable
-                onPress={() => handleComponentComplete(currentComponent.id)}
-                style={({ pressed }) => [{ backgroundColor: colors.primary, borderRadius: 8, padding: 14, marginTop: 12, opacity: pressed ? 0.8 : 1 }]}
-              >
+              <Pressable onPress={() => handleComponentComplete(currentComponent.id)}
+                style={({ pressed }) => [{ backgroundColor: colors.primary, borderRadius: 8, padding: 14, marginTop: 12, opacity: pressed ? 0.8 : 1 }]}>
                 <Text className="text-center font-semibold text-background text-base">Bestätigen</Text>
               </Pressable>
             </View>
@@ -449,11 +364,7 @@ export default function FeedingModeScreen() {
                 const actual = actualAmounts[id] || 0;
                 const diff = actual - planned;
                 return (
-                  <View
-                    key={id}
-                    className="p-3 rounded-lg border"
-                    style={{ borderColor: colors.success, backgroundColor: colors.surface }}
-                  >
+                  <View key={id} className="p-3 rounded-lg border" style={{ borderColor: colors.success, backgroundColor: colors.surface }}>
                     <View className="flex-row justify-between items-center">
                       <Text className="text-sm font-semibold text-foreground">{comp?.name}</Text>
                       <Text className="text-xs font-semibold text-success">✓ Fertig</Text>
@@ -461,7 +372,7 @@ export default function FeedingModeScreen() {
                     <View className="flex-row justify-between mt-1">
                       <Text className="text-xs text-muted">Ist: {formatAmount(actual)} kg</Text>
                       <Text className="text-xs text-muted">Soll: {formatAmount(planned)} kg</Text>
-                      <Text className={`text-xs font-medium ${diff > 0 ? 'text-orange-500' : diff < 0 ? 'text-blue-500' : 'text-success'}`}>
+                      <Text className="text-xs font-medium" style={{ color: Math.abs(diff) < 0.05 ? colors.success : diff > 0 ? '#f97316' : '#3b82f6' }}>
                         {diff > 0 ? '+' : ''}{formatAmount(diff)} kg
                       </Text>
                     </View>
@@ -471,16 +382,35 @@ export default function FeedingModeScreen() {
             </View>
           )}
 
+          {completedComponents.length > 0 && completedComponents.length < orderedComponents.length && (
+            <View className="gap-2">
+              <Text className="text-xs font-semibold text-muted uppercase">Noch zu laden (aktualisiert)</Text>
+              {orderedComponents
+                .filter((c) => !completedComponents.includes(c.id) && c.id !== currentComponent?.id)
+                .map((comp) => (
+                  <View key={comp.id} className="p-3 rounded-lg border" style={{ borderColor: colors.border, backgroundColor: colors.surface }}>
+                    <View className="flex-row justify-between">
+                      <Text className="text-xs text-muted">{comp.name}</Text>
+                      <Text className="text-xs font-medium text-foreground">{formatAmount(plannedAmounts[comp.id] || 0)} kg</Text>
+                    </View>
+                  </View>
+                ))}
+            </View>
+          )}
+
           {completedComponents.length === orderedComponents.length && (
-            <Pressable
-              onPress={handleSave}
-              disabled={isSaving}
-              style={({ pressed }) => [{ backgroundColor: colors.success, borderRadius: 8, padding: 16, opacity: pressed || isSaving ? 0.8 : 1 }]}
-            >
-              <Text className="text-center font-semibold text-background text-base">
-                {isSaving ? 'Speichert...' : 'Fütterung abschließen'}
-              </Text>
-            </Pressable>
+            <View className="gap-3">
+              <View className="p-4 bg-primary/10 rounded-lg border border-primary/20">
+                <Text className="text-sm font-bold text-foreground text-center">Gesamtmenge: {formatAmount(getCumulativeActual())} kg</Text>
+                <Text className="text-xs text-muted text-center mt-1">Geplant: {totalAmount} kg</Text>
+              </View>
+              <Pressable onPress={handleSave} disabled={isSaving}
+                style={({ pressed }) => [{ backgroundColor: colors.success, borderRadius: 8, padding: 16, opacity: pressed || isSaving ? 0.8 : 1 }]}>
+                <Text className="text-center font-semibold text-background text-base">
+                  {isSaving ? 'Speichert...' : 'Fütterung abschließen'}
+                </Text>
+              </Pressable>
+            </View>
           )}
         </View>
       </ScrollView>
