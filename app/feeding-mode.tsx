@@ -48,6 +48,8 @@ const GROUPS_KEY = 'app:animal_groups';
 
 const parseAmount = (value: string): number => parseFloat(value.replace(',', '.')) || 0;
 const formatAmount = (value: number): string => value.toFixed(2);
+const roundTo5 = (value: number): number => Math.round(value / 5) * 5;
+const formatTarget = (value: number): string => roundTo5(value).toFixed(0);
 const isValidNumber = (value: string): boolean => !isNaN(parseFloat(value.replace(',', '.')));
 const calculateTotalRation = (components: Record<string, number>): number =>
   Object.values(components).reduce((a, b) => a + b, 0);
@@ -154,11 +156,8 @@ export default function FeedingModeScreen() {
     setIsStarted(true);
   };
 
-  const getCumulativeTarget = (componentId: string): number => {
-    const index = orderedComponents.findIndex((c) => c.id === componentId);
-    let sum = 0;
-    for (let i = 0; i <= index; i++) sum += plannedAmounts[orderedComponents[i].id] || 0;
-    return sum;
+   const getCumulativeTarget = (componentId: string): number => {
+    return getCumulativeActual() + roundTo5(plannedAmounts[componentId] || 0);
   };
 
   const getCumulativeActual = (): number =>
@@ -203,6 +202,19 @@ export default function FeedingModeScreen() {
       const logs = await AsyncStorage.getItem(`logs_${selectedGroupId}`);
       const existingLogs = logs ? JSON.parse(logs) : [];
       await AsyncStorage.setItem(`logs_${selectedGroupId}`, JSON.stringify([...existingLogs, session]));
+ // Bestand automatisch abziehen (nur verfolgte Komponenten)
+      try {
+        const bestandData = await AsyncStorage.getItem('app:bestand');
+        if (bestandData) {
+          const bestand = JSON.parse(bestandData);
+          for (const [compId, amount] of Object.entries(actualAmounts)) {
+            if (bestand[compId] && bestand[compId].tracked) {
+              bestand[compId].currentStock = Math.max(0, (bestand[compId].currentStock || 0) - (amount as number));
+            }
+          }
+          await AsyncStorage.setItem('app:bestand', JSON.stringify(bestand));
+        }
+      } catch { console.error('Bestand update failed'); }
       Alert.alert('Erfolg', `Fütterung gespeichert! Gesamt: ${formatAmount(finalTotal)} kg`, [
         { text: 'OK', onPress: () => router.back() },
       ]);
@@ -327,18 +339,17 @@ export default function FeedingModeScreen() {
                 })}
                 <View className="flex-row justify-between mt-1 pt-1" style={{ borderTopWidth: 1, borderTopColor: colors.border }}>
                   <Text className="text-sm font-semibold text-foreground">+ {currentComponent.name}</Text>
-                  <Text className="text-sm font-semibold text-foreground">{formatAmount(plannedAmounts[currentComponent.id] || 0)} kg</Text>
-                </View>
+                 <Text className="text-sm font-semibold text-foreground">{formatTarget(plannedAmounts[currentComponent.id] || 0)} kg</Text>                </View>
                 <View className="flex-row justify-between mt-1">
                   <Text className="text-sm font-bold text-primary">Waage-Zielwert</Text>
-                  <Text className="text-sm font-bold text-primary">{formatAmount(cumulativeTarget)} kg</Text>
+                  <Text className="text-sm font-bold text-primary">{formatTarget(cumulativeTarget)} kg</Text>
                 </View>
               </View>
 
               <View className="flex-row items-center gap-2 px-3 py-3 bg-background rounded-lg border" style={{ borderColor: colors.primary }}>
                 <TextInput
                   className="flex-1 text-foreground text-xl font-bold"
-                  placeholder={formatAmount(cumulativeTarget)}
+                  placeholder={formatTarget(cumulativeTarget)}
                   placeholderTextColor={colors.muted}
                   keyboardType="decimal-pad"
                   value={scaleInputs[currentComponent.id] || ''}
@@ -371,7 +382,7 @@ export default function FeedingModeScreen() {
                     </View>
                     <View className="flex-row justify-between mt-1">
                       <Text className="text-xs text-muted">Ist: {formatAmount(actual)} kg</Text>
-                      <Text className="text-xs text-muted">Soll: {formatAmount(planned)} kg</Text>
+                      <Text className="text-xs text-muted">Soll: {formatTarget(planned)} kg</Text>
                       <Text className="text-xs font-medium" style={{ color: Math.abs(diff) < 0.05 ? colors.success : diff > 0 ? '#f97316' : '#3b82f6' }}>
                         {diff > 0 ? '+' : ''}{formatAmount(diff)} kg
                       </Text>
@@ -391,8 +402,7 @@ export default function FeedingModeScreen() {
                   <View key={comp.id} className="p-3 rounded-lg border" style={{ borderColor: colors.border, backgroundColor: colors.surface }}>
                     <View className="flex-row justify-between">
                       <Text className="text-xs text-muted">{comp.name}</Text>
-                      <Text className="text-xs font-medium text-foreground">{formatAmount(plannedAmounts[comp.id] || 0)} kg</Text>
-                    </View>
+                      <Text className="text-xs font-medium text-foreground">{formatTarget(plannedAmounts[comp.id] || 0)} kg</Text>                    </View>
                   </View>
                 ))}
             </View>
