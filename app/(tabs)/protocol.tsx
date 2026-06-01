@@ -1,7 +1,17 @@
-Klammern sind ausbalanciert. Hier der letzte Schritt – die app/(tabs)/protocol.tsx komplett ersetzen.
+Jetzt ist es klar! Beim Kopieren ist der Begleittext mit in die Datei gerutscht. Die erste Zeile deiner protocol.tsx lautet aktuell:
+
+„Klammern sind ausbalanciert. Hier der letzte Schritt..."
+
+Das ist mein Erklärungstext, kein Code – deshalb der Fehler.
+So behebst du es:
+
 Öffne die Datei:
+
 cmdnotepad "app\(tabs)\protocol.tsx"
-Markiere alles (Strg+A), lösche es, und füge diesen kompletten Inhalt ein:
+
+Markiere alles mit Strg + A und lösche es
+Füge nur diesen Code ein – er muss mit import beginnen, nichts davor:
+
 tsximport React, { useState, useEffect, useCallback } from 'react';
 import { ScrollView, Text, View, Pressable, Share, Alert, Dimensions } from 'react-native';
 import { ScreenContainer } from '@/components/screen-container';
