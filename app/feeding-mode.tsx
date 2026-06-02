@@ -24,6 +24,9 @@ interface FeedingSession {
   animalGroupId: AnimalGroupId;
   timestamp: number;
   totalAmount: number;
+  freshAmount?: number;
+  restAmount?: number;
+  restPerComponent?: Record<string, number>;
   plannedAmounts: Record<string, number>;
   actualAmounts: Record<string, number>;
   completed: boolean;
@@ -66,19 +69,22 @@ const calculatePlannedAmounts = (
   );
 };
 
-// Recalculate remaining components based on ratio implied by actual amount loaded
-const recalculateFromActual = (
-  baseRatios: Record<string, number>,
-  completedId: string,
-  actualAmount: number,
-  remainingIds: string[]
-): Record<string, number> => {
-  const componentRatio = baseRatios[completedId] || 0;
-  if (componentRatio === 0) return {};
-  const impliedTotal = actualAmount / componentRatio;
-  return Object.fromEntries(
-    remainingIds.map((id) => [id, (baseRatios[id] || 0) * impliedTotal])
-  );
+// Berechne Durchschnitt der implizierten Tieranzahl aus allen gefütterten Komponenten
+const calcAverageAnimalCount = (
+  completedIds: string[],
+  actualAmounts: Record<string, number>,
+  restPerComponent: Record<string, number>,
+  baseRationPerAnimal: Record<string, number>
+): number => {
+  const counts = completedIds
+    .filter((id) => (baseRationPerAnimal[id] || 0) > 0)
+    .map((id) => {
+      const fresh = actualAmounts[id] || 0;
+      const rest = restPerComponent[id] || 0;
+      return (fresh + rest) / baseRationPerAnimal[id];
+    });
+  if (counts.length === 0) return 0;
+  return counts.reduce((a, b) => a + b, 0) / counts.length;
 };
 
 export default function FeedingModeScreen() {
@@ -94,6 +100,8 @@ export default function FeedingModeScreen() {
   const [activeComponents, setActiveComponents] = useState<FeedingComponent[]>([]);
   const [orderedComponents, setOrderedComponents] = useState<FeedingComponent[]>([]);
   const [baseRatios, setBaseRatios] = useState<Record<string, number>>({});
+  const [baseRationPerAnimal, setBaseRationPerAnimal] = useState<Record<string, number>>({});
+  const [prevSession, setPrevSession] = useState<any>(null);
 
   useEffect(() => {
     const load = async () => {
@@ -111,13 +119,24 @@ export default function FeedingModeScreen() {
             const active = defs.filter((c: FeedingComponent) => (ration.components[c.id] || 0) > 0);
             setActiveComponents(active);
             setOrderedComponents(active);
+
             const total = calculateTotalRation(ration.components);
             const ratios: Record<string, number> = {};
+            const perAnimal: Record<string, number> = {};
             for (const comp of active) {
               ratios[comp.id] = total > 0 ? (ration.components[comp.id] || 0) / total : 0;
+              perAnimal[comp.id] = ration.components[comp.id] || 0;
             }
             setBaseRatios(ratios);
+            setBaseRationPerAnimal(perAnimal);
           }
+        }
+
+        // Letzte Fütterung laden für Rest-Funktion
+        const logsData = await AsyncStorage.getItem(`logs_${selectedGroupId}`);
+        if (logsData) {
+          const logs = JSON.parse(logsData);
+          if (logs.length > 0) setPrevSession(logs[logs.length - 1]);
         }
       } catch (error) { console.error('Error loading ration:', error); }
     };
@@ -125,6 +144,8 @@ export default function FeedingModeScreen() {
   }, [selectedGroupId]);
 
   const [totalAmount, setTotalAmount] = useState('');
+  const [restAmount, setRestAmount] = useState('');
+  const [restPerComponent, setRestPerComponent] = useState<Record<string, number>>({});
   const [plannedAmounts, setPlannedAmounts] = useState<Record<string, number>>({});
   const [actualAmounts, setActualAmounts] = useState<Record<string, number>>({});
   const [scaleInputs, setScaleInputs] = useState<Record<string, string>>({});
@@ -149,15 +170,43 @@ export default function FeedingModeScreen() {
     const activeRationComponents = Object.fromEntries(
       orderedComponents.map((c) => [c.id, currentRation.components[c.id] || 0])
     );
-    setPlannedAmounts(calculatePlannedAmounts(activeRationComponents, total));
+    const planned = calculatePlannedAmounts(activeRationComponents, total);
+
+    // Rest-Berechnung aus vorheriger Fütterung
+    const restKg = parseAmount(restAmount);
+    let restComps: Record<string, number> = {};
+    if (restKg > 0 && prevSession) {
+      const prevActuals = prevSession.actualAmounts as Record<string, number>;
+      const prevRestComps = (prevSession.restPerComponent || {}) as Record<string, number>;
+      const prevTotalAmounts: Record<string, number> = {};
+      for (const id of Object.keys(prevActuals)) {
+        prevTotalAmounts[id] = (prevActuals[id] || 0) + (prevRestComps[id] || 0);
+      }
+      const prevGrandTotal = Object.values(prevTotalAmounts).reduce((a: number, b: number) => a + b, 0);
+      if (prevGrandTotal > 0) {
+        restComps = Object.fromEntries(
+          Object.entries(prevTotalAmounts).map(([id, val]) => [id, restKg * (val / prevGrandTotal)])
+        );
+      }
+    }
+    setRestPerComponent(restComps);
+
+    // Zielmenge pro Komponente = Gesamtziel minus Rest-Anteil
+    const adjustedPlanned: Record<string, number> = {};
+    for (const [id, target] of Object.entries(planned)) {
+      adjustedPlanned[id] = Math.max(0, target - (restComps[id] || 0));
+    }
+    setPlannedAmounts(adjustedPlanned);
     setActualAmounts({});
     setScaleInputs({});
     setCompletedComponents([]);
     setIsStarted(true);
   };
 
-   const getCumulativeTarget = (componentId: string): number => {
-    return getCumulativeActual() + roundTo5(plannedAmounts[componentId] || 0);
+  // Waage-Zielwert: Rest + bereits geladen + aktuelle Komponente (gerundet auf 5kg)
+  const getCumulativeTarget = (componentId: string): number => {
+    const restKg = parseAmount(restAmount);
+    return restKg + getCumulativeActual() + roundTo5(plannedAmounts[componentId] || 0);
   };
 
   const getCumulativeActual = (): number =>
@@ -168,7 +217,8 @@ export default function FeedingModeScreen() {
     if (!isValidNumber(scaleValue)) { Alert.alert('Fehler', 'Bitte gib einen gültigen Waagenwert ein'); return; }
 
     const scaleReading = parseAmount(scaleValue);
-    const previousCumulative = getCumulativeActual();
+    const restKg = parseAmount(restAmount);
+    const previousCumulative = restKg + getCumulativeActual();
     const actualAmount = scaleReading - previousCumulative;
 
     if (actualAmount < 0) {
@@ -180,9 +230,25 @@ export default function FeedingModeScreen() {
       .map((c) => c.id)
       .filter((id) => !completedComponents.includes(id) && id !== componentId);
 
-    // Recalculate remaining based on implied total from actual amount and base ratio
-    if (remainingIds.length > 0 && baseRatios[componentId] > 0) {
-      const newAmounts = recalculateFromActual(baseRatios, componentId, actualAmount, remainingIds);
+    const updatedActuals = { ...actualAmounts, [componentId]: actualAmount };
+    const updatedCompleted = [...completedComponents, componentId];
+
+    // Durchschnittliche Tieranzahl aus allen gefütterten Komponenten (inkl. Rest)
+    const avgAnimals = calcAverageAnimalCount(
+      updatedCompleted,
+      updatedActuals,
+      restPerComponent,
+      baseRationPerAnimal
+    );
+
+    // Alle ausstehenden Komponenten neu berechnen (minus jeweiligem Rest-Anteil)
+    if (remainingIds.length > 0 && avgAnimals > 0) {
+      const newAmounts = Object.fromEntries(
+        remainingIds.map((id) => [
+          id,
+          Math.max(0, avgAnimals * (baseRationPerAnimal[id] || 0) - (restPerComponent[id] || 0))
+        ])
+      );
       setPlannedAmounts((prev) => ({ ...prev, ...newAmounts }));
     }
 
@@ -194,15 +260,25 @@ export default function FeedingModeScreen() {
     if (completedComponents.length !== orderedComponents.length) { Alert.alert('Fehler', 'Bitte füttere alle Komponenten'); return; }
     setIsSaving(true);
     try {
-      const finalTotal = getCumulativeActual();
+      const restKg = parseAmount(restAmount);
+      const freshTotal = getCumulativeActual();
       const session: FeedingSession = {
-        id: generateId(), animalGroupId: selectedGroupId, timestamp: Date.now(),
-        totalAmount: finalTotal, plannedAmounts, actualAmounts, completed: true,
+        id: generateId(),
+        animalGroupId: selectedGroupId,
+        timestamp: Date.now(),
+        totalAmount: freshTotal + restKg,
+        freshAmount: freshTotal,
+        restAmount: restKg,
+        restPerComponent,
+        plannedAmounts,
+        actualAmounts,
+        completed: true,
       };
       const logs = await AsyncStorage.getItem(`logs_${selectedGroupId}`);
       const existingLogs = logs ? JSON.parse(logs) : [];
       await AsyncStorage.setItem(`logs_${selectedGroupId}`, JSON.stringify([...existingLogs, session]));
- // Bestand automatisch abziehen (nur verfolgte Komponenten)
+
+      // Bestand automatisch abziehen (nur verfolgte Komponenten, nur frisch Geladenes)
       try {
         const bestandData = await AsyncStorage.getItem('app:bestand');
         if (bestandData) {
@@ -215,7 +291,8 @@ export default function FeedingModeScreen() {
           await AsyncStorage.setItem('app:bestand', JSON.stringify(bestand));
         }
       } catch { console.error('Bestand update failed'); }
-      Alert.alert('Erfolg', `Fütterung gespeichert! Gesamt: ${formatAmount(finalTotal)} kg`, [
+
+      Alert.alert('Erfolg', `Fütterung gespeichert!\nFrisch: ${formatAmount(freshTotal)} kg${restKg > 0 ? `\nRest genutzt: ${formatAmount(restKg)} kg\nGesamt: ${formatAmount(freshTotal + restKg)} kg` : ''}`, [
         { text: 'OK', onPress: () => router.back() },
       ]);
     } catch { Alert.alert('Fehler', 'Fütterung konnte nicht gespeichert werden'); }
@@ -237,7 +314,7 @@ export default function FeedingModeScreen() {
               <View className="flex-row items-center gap-2 px-4 py-3 bg-surface rounded-lg border border-border" style={{ borderColor: colors.border }}>
                 <TextInput
                   className="flex-1 text-foreground text-lg font-semibold"
-                  placeholder="z.B. 500"
+                  placeholder="z.B. 2000"
                   placeholderTextColor={colors.muted}
                   keyboardType="decimal-pad"
                   value={totalAmount}
@@ -246,6 +323,45 @@ export default function FeedingModeScreen() {
                 <Text className="text-sm text-muted font-medium">kg</Text>
               </View>
             </View>
+
+            {prevSession && (
+              <View className="gap-3">
+                <Text className="text-sm font-semibold text-foreground">Rest aus vorheriger Fütterung</Text>
+                <View className="flex-row items-center gap-2 px-4 py-3 bg-surface rounded-lg border border-border" style={{ borderColor: colors.border }}>
+                  <TextInput
+                    className="flex-1 text-foreground text-lg font-semibold"
+                    placeholder="0"
+                    placeholderTextColor={colors.muted}
+                    keyboardType="decimal-pad"
+                    value={restAmount}
+                    onChangeText={setRestAmount}
+                  />
+                  <Text className="text-sm text-muted font-medium">kg</Text>
+                </View>
+
+                {parseAmount(restAmount) > 0 && (
+                  <View className="p-3 bg-primary/10 rounded-lg border border-primary/20 gap-1">
+                    <Text className="text-xs font-semibold text-foreground">Geschätzte Rest-Zusammensetzung</Text>
+                    {(() => {
+                      const prevActuals = prevSession.actualAmounts as Record<string, number>;
+                      const prevRestComps = (prevSession.restPerComponent || {}) as Record<string, number>;
+                      const prevTotalAmounts: Record<string, number> = {};
+                      for (const id of Object.keys(prevActuals)) {
+                        prevTotalAmounts[id] = (prevActuals[id] || 0) + (prevRestComps[id] || 0);
+                      }
+                      const prevGrandTotal = Object.values(prevTotalAmounts).reduce((a: number, b: number) => a + b, 0);
+                      return Object.entries(prevTotalAmounts).map(([id, val]) => {
+                        const restShare = prevGrandTotal > 0 ? parseAmount(restAmount) * (val / prevGrandTotal) : 0;
+                        if (restShare < 0.5) return null;
+                        return (
+                          <Text key={id} className="text-xs text-muted">{id}: {restShare.toFixed(0)} kg</Text>
+                        );
+                      });
+                    })()}
+                  </View>
+                )}
+              </View>
+            )}
 
             {orderedComponents.length > 0 && (
               <View className="gap-3">
@@ -309,8 +425,19 @@ export default function FeedingModeScreen() {
         <View className="flex-1 gap-4">
           <View className="gap-1 mb-2">
             <Text className="text-2xl font-bold text-foreground">Fütterung läuft</Text>
-            <Text className="text-sm text-muted">{selectedGroup?.name} • Ziel: {totalAmount} kg</Text>
+            <Text className="text-sm text-muted">
+              {selectedGroup?.name} • Ziel: {totalAmount} kg
+              {parseAmount(restAmount) > 0 ? ` (inkl. ${parseAmount(restAmount).toFixed(0)} kg Rest)` : ''}
+            </Text>
           </View>
+
+          {parseAmount(restAmount) > 0 && (
+            <View className="p-3 bg-primary/10 rounded-lg border border-primary/20">
+              <Text className="text-xs font-semibold text-foreground">
+                ✓ {parseAmount(restAmount).toFixed(0)} kg Rest bereits eingerechnet – Waage startet bei {parseAmount(restAmount).toFixed(0)} kg
+              </Text>
+            </View>
+          )}
 
           <View className="gap-2 p-3 bg-primary/10 rounded-lg">
             <View className="flex-row justify-between items-center">
@@ -328,6 +455,12 @@ export default function FeedingModeScreen() {
               <Text className="text-lg font-bold text-foreground mb-1">{currentComponent.name}</Text>
 
               <View className="gap-1 mb-3 p-3 bg-primary/10 rounded-lg">
+                {parseAmount(restAmount) > 0 && (
+                  <View className="flex-row justify-between">
+                    <Text className="text-xs text-muted">Rest (bereits vorhanden)</Text>
+                    <Text className="text-xs text-muted">{parseAmount(restAmount).toFixed(0)} kg ✓</Text>
+                  </View>
+                )}
                 {completedComponents.map((id) => {
                   const comp = orderedComponents.find((c) => c.id === id);
                   return (
@@ -339,7 +472,8 @@ export default function FeedingModeScreen() {
                 })}
                 <View className="flex-row justify-between mt-1 pt-1" style={{ borderTopWidth: 1, borderTopColor: colors.border }}>
                   <Text className="text-sm font-semibold text-foreground">+ {currentComponent.name}</Text>
-                 <Text className="text-sm font-semibold text-foreground">{formatTarget(plannedAmounts[currentComponent.id] || 0)} kg</Text>                </View>
+                  <Text className="text-sm font-semibold text-foreground">{formatTarget(plannedAmounts[currentComponent.id] || 0)} kg</Text>
+                </View>
                 <View className="flex-row justify-between mt-1">
                   <Text className="text-sm font-bold text-primary">Waage-Zielwert</Text>
                   <Text className="text-sm font-bold text-primary">{formatTarget(cumulativeTarget)} kg</Text>
@@ -373,7 +507,7 @@ export default function FeedingModeScreen() {
                 const comp = orderedComponents.find((c) => c.id === id);
                 const planned = plannedAmounts[id] || 0;
                 const actual = actualAmounts[id] || 0;
-                const diff = actual - planned;
+                const diff = actual - roundTo5(planned);
                 return (
                   <View key={id} className="p-3 rounded-lg border" style={{ borderColor: colors.success, backgroundColor: colors.surface }}>
                     <View className="flex-row justify-between items-center">
@@ -383,8 +517,8 @@ export default function FeedingModeScreen() {
                     <View className="flex-row justify-between mt-1">
                       <Text className="text-xs text-muted">Ist: {formatAmount(actual)} kg</Text>
                       <Text className="text-xs text-muted">Soll: {formatTarget(planned)} kg</Text>
-                      <Text className="text-xs font-medium" style={{ color: Math.abs(diff) < 0.05 ? colors.success : diff > 0 ? '#f97316' : '#3b82f6' }}>
-                        {diff > 0 ? '+' : ''}{formatAmount(diff)} kg
+                      <Text className="text-xs font-medium" style={{ color: Math.abs(diff) < 2.5 ? colors.success : diff > 0 ? '#f97316' : '#3b82f6' }}>
+                        {diff > 0 ? '+' : ''}{diff.toFixed(0)} kg
                       </Text>
                     </View>
                   </View>
@@ -402,7 +536,8 @@ export default function FeedingModeScreen() {
                   <View key={comp.id} className="p-3 rounded-lg border" style={{ borderColor: colors.border, backgroundColor: colors.surface }}>
                     <View className="flex-row justify-between">
                       <Text className="text-xs text-muted">{comp.name}</Text>
-                      <Text className="text-xs font-medium text-foreground">{formatTarget(plannedAmounts[comp.id] || 0)} kg</Text>                    </View>
+                      <Text className="text-xs font-medium text-foreground">{formatTarget(plannedAmounts[comp.id] || 0)} kg</Text>
+                    </View>
                   </View>
                 ))}
             </View>
@@ -410,9 +545,19 @@ export default function FeedingModeScreen() {
 
           {completedComponents.length === orderedComponents.length && (
             <View className="gap-3">
-              <View className="p-4 bg-primary/10 rounded-lg border border-primary/20">
-                <Text className="text-sm font-bold text-foreground text-center">Gesamtmenge: {formatAmount(getCumulativeActual())} kg</Text>
-                <Text className="text-xs text-muted text-center mt-1">Geplant: {totalAmount} kg</Text>
+              <View className="p-4 bg-primary/10 rounded-lg border border-primary/20 gap-1">
+                <Text className="text-sm font-bold text-foreground text-center">
+                  Frisch geladen: {formatAmount(getCumulativeActual())} kg
+                </Text>
+                {parseAmount(restAmount) > 0 && (
+                  <Text className="text-xs text-muted text-center">
+                    Rest genutzt: {parseAmount(restAmount).toFixed(0)} kg
+                  </Text>
+                )}
+                <Text className="text-sm font-bold text-primary text-center">
+                  Gesamt: {formatAmount(getCumulativeActual() + parseAmount(restAmount))} kg
+                </Text>
+                <Text className="text-xs text-muted text-center">Geplant: {totalAmount} kg</Text>
               </View>
               <Pressable onPress={handleSave} disabled={isSaving}
                 style={({ pressed }) => [{ backgroundColor: colors.success, borderRadius: 8, padding: 16, opacity: pressed || isSaving ? 0.8 : 1 }]}>
