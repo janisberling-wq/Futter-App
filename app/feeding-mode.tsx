@@ -32,7 +32,12 @@ interface FeedingSession {
   completed: boolean;
 }
 
-const ANIMAL_GROUPS = [
+interface AnimalGroup {
+  id: string;
+  name: string;
+}
+
+const DEFAULT_ANIMAL_GROUPS: AnimalGroup[] = [
   { id: 'milchkuehe', name: 'Milchkühe' },
   { id: 'fresser', name: 'Fresser' },
   { id: 'bullen', name: 'Bullen' },
@@ -69,7 +74,6 @@ const calculatePlannedAmounts = (
   );
 };
 
-// Berechne Durchschnitt der implizierten Tieranzahl aus allen gefütterten Komponenten
 const calcAverageAnimalCount = (
   completedIds: string[],
   actualAmounts: Record<string, number>,
@@ -93,21 +97,24 @@ export default function FeedingModeScreen() {
   const { groupId } = useLocalSearchParams<{ groupId: string }>();
 
   const selectedGroupId = groupId || 'milchkuehe';
-  const [allGroups, setAllGroups] = useState(ANIMAL_GROUPS);
+  const [allGroups, setAllGroups] = useState<AnimalGroup[]>(DEFAULT_ANIMAL_GROUPS);
   const selectedGroup = allGroups.find((g) => g.id === selectedGroupId);
 
   const [currentRation, setCurrentRation] = useState<BaseRation | null>(null);
   const [activeComponents, setActiveComponents] = useState<FeedingComponent[]>([]);
   const [orderedComponents, setOrderedComponents] = useState<FeedingComponent[]>([]);
-  const [baseRatios, setBaseRatios] = useState<Record<string, number>>({});
   const [baseRationPerAnimal, setBaseRationPerAnimal] = useState<Record<string, number>>({});
-  const [prevSession, setPrevSession] = useState<any>(null);
+
+  const [lastSessionPerGroup, setLastSessionPerGroup] = useState<Record<string, FeedingSession>>({});
+  const [restGroupId, setRestGroupId] = useState<string>('none');
+  const prevSession = restGroupId !== 'none' ? lastSessionPerGroup[restGroupId] : null;
 
   useEffect(() => {
     const load = async () => {
       try {
         const groupData = await AsyncStorage.getItem(GROUPS_KEY);
-        if (groupData) setAllGroups(JSON.parse(groupData));
+        const groups: AnimalGroup[] = groupData ? JSON.parse(groupData) : DEFAULT_ANIMAL_GROUPS;
+        setAllGroups(groups);
 
         const data = await AsyncStorage.getItem('feeding:base_rations');
         if (data) {
@@ -117,27 +124,43 @@ export default function FeedingModeScreen() {
           if (ration) {
             const defs = ration.componentDefs || DEFAULT_FEEDING_COMPONENTS;
             const active = defs.filter((c: FeedingComponent) => (ration.components[c.id] || 0) > 0);
-            setActiveComponents(active);
-            setOrderedComponents(active);
 
-            const total = calculateTotalRation(ration.components);
-            const ratios: Record<string, number> = {};
+            // Gespeicherte Reihenfolge laden
+            const savedOrderData = await AsyncStorage.getItem(`feeding:order_${selectedGroupId}`);
+            if (savedOrderData) {
+              const savedIds: string[] = JSON.parse(savedOrderData);
+              const ordered: FeedingComponent[] = [];
+              for (const id of savedIds) {
+                const comp = active.find((c: FeedingComponent) => c.id === id);
+                if (comp) ordered.push(comp);
+              }
+              for (const comp of active) {
+                if (!ordered.find((c) => c.id === comp.id)) ordered.push(comp);
+              }
+              setOrderedComponents(ordered);
+            } else {
+              setOrderedComponents(active);
+            }
+            setActiveComponents(active);
+
             const perAnimal: Record<string, number> = {};
             for (const comp of active) {
-              ratios[comp.id] = total > 0 ? (ration.components[comp.id] || 0) / total : 0;
               perAnimal[comp.id] = ration.components[comp.id] || 0;
             }
-            setBaseRatios(ratios);
             setBaseRationPerAnimal(perAnimal);
           }
         }
 
-        // Letzte Fütterung laden für Rest-Funktion
-        const logsData = await AsyncStorage.getItem(`logs_${selectedGroupId}`);
-        if (logsData) {
-          const logs = JSON.parse(logsData);
-          if (logs.length > 0) setPrevSession(logs[logs.length - 1]);
+        // Letzte Fütterung pro Gruppe laden
+        const lastSessions: Record<string, FeedingSession> = {};
+        for (const group of groups) {
+          const logsData = await AsyncStorage.getItem(`logs_${group.id}`);
+          if (logsData) {
+            const logs: FeedingSession[] = JSON.parse(logsData);
+            if (logs.length > 0) lastSessions[group.id] = logs[logs.length - 1];
+          }
         }
+        setLastSessionPerGroup(lastSessions);
       } catch (error) { console.error('Error loading ration:', error); }
     };
     load();
@@ -153,12 +176,18 @@ export default function FeedingModeScreen() {
   const [isStarted, setIsStarted] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
-  const moveComponent = (index: number, direction: 'up' | 'down') => {
+  const moveComponent = async (index: number, direction: 'up' | 'down') => {
     const newOrder = [...orderedComponents];
     const swapIndex = direction === 'up' ? index - 1 : index + 1;
     if (swapIndex < 0 || swapIndex >= newOrder.length) return;
     [newOrder[index], newOrder[swapIndex]] = [newOrder[swapIndex], newOrder[index]];
     setOrderedComponents(newOrder);
+    try {
+      await AsyncStorage.setItem(
+        `feeding:order_${selectedGroupId}`,
+        JSON.stringify(newOrder.map((c) => c.id))
+      );
+    } catch { console.error('Failed to save order'); }
   };
 
   const handleStart = () => {
@@ -172,7 +201,6 @@ export default function FeedingModeScreen() {
     );
     const planned = calculatePlannedAmounts(activeRationComponents, total);
 
-    // Rest-Berechnung aus vorheriger Fütterung
     const restKg = parseAmount(restAmount);
     let restComps: Record<string, number> = {};
     if (restKg > 0 && prevSession) {
@@ -191,7 +219,6 @@ export default function FeedingModeScreen() {
     }
     setRestPerComponent(restComps);
 
-    // Zielmenge pro Komponente = Gesamtziel minus Rest-Anteil
     const adjustedPlanned: Record<string, number> = {};
     for (const [id, target] of Object.entries(planned)) {
       adjustedPlanned[id] = Math.max(0, target - (restComps[id] || 0));
@@ -203,14 +230,13 @@ export default function FeedingModeScreen() {
     setIsStarted(true);
   };
 
-  // Waage-Zielwert: Rest + bereits geladen + aktuelle Komponente (gerundet auf 5kg)
+  const getCumulativeActual = (): number =>
+    completedComponents.reduce((sum, id) => sum + (actualAmounts[id] || 0), 0);
+
   const getCumulativeTarget = (componentId: string): number => {
     const restKg = parseAmount(restAmount);
     return restKg + getCumulativeActual() + roundTo5(plannedAmounts[componentId] || 0);
   };
-
-  const getCumulativeActual = (): number =>
-    completedComponents.reduce((sum, id) => sum + (actualAmounts[id] || 0), 0);
 
   const handleComponentComplete = (componentId: string) => {
     const scaleValue = scaleInputs[componentId] || '';
@@ -233,7 +259,6 @@ export default function FeedingModeScreen() {
     const updatedActuals = { ...actualAmounts, [componentId]: actualAmount };
     const updatedCompleted = [...completedComponents, componentId];
 
-    // Durchschnittliche Tieranzahl aus allen gefütterten Komponenten (inkl. Rest)
     const avgAnimals = calcAverageAnimalCount(
       updatedCompleted,
       updatedActuals,
@@ -241,7 +266,6 @@ export default function FeedingModeScreen() {
       baseRationPerAnimal
     );
 
-    // Alle ausstehenden Komponenten neu berechnen (minus jeweiligem Rest-Anteil)
     if (remainingIds.length > 0 && avgAnimals > 0) {
       const newAmounts = Object.fromEntries(
         remainingIds.map((id) => [
@@ -278,7 +302,6 @@ export default function FeedingModeScreen() {
       const existingLogs = logs ? JSON.parse(logs) : [];
       await AsyncStorage.setItem(`logs_${selectedGroupId}`, JSON.stringify([...existingLogs, session]));
 
-      // Bestand automatisch abziehen (nur verfolgte Komponenten, nur frisch Geladenes)
       try {
         const bestandData = await AsyncStorage.getItem('app:bestand');
         if (bestandData) {
@@ -300,6 +323,7 @@ export default function FeedingModeScreen() {
   };
 
   if (!isStarted) {
+    const restKg = parseAmount(restAmount);
     return (
       <ScreenContainer className="p-6">
         <ScrollView contentContainerStyle={{ flexGrow: 1 }}>
@@ -324,48 +348,88 @@ export default function FeedingModeScreen() {
               </View>
             </View>
 
-            {prevSession && (
-              <View className="gap-3">
-                <Text className="text-sm font-semibold text-foreground">Rest aus vorheriger Fütterung</Text>
-                <View className="flex-row items-center gap-2 px-4 py-3 bg-surface rounded-lg border border-border" style={{ borderColor: colors.border }}>
-                  <TextInput
-                    className="flex-1 text-foreground text-lg font-semibold"
-                    placeholder="0"
-                    placeholderTextColor={colors.muted}
-                    keyboardType="decimal-pad"
-                    value={restAmount}
-                    onChangeText={setRestAmount}
-                  />
-                  <Text className="text-sm text-muted font-medium">kg</Text>
-                </View>
-
-                {parseAmount(restAmount) > 0 && (
-                  <View className="p-3 bg-primary/10 rounded-lg border border-primary/20 gap-1">
-                    <Text className="text-xs font-semibold text-foreground">Geschätzte Rest-Zusammensetzung</Text>
-                    {(() => {
-                      const prevActuals = prevSession.actualAmounts as Record<string, number>;
-                      const prevRestComps = (prevSession.restPerComponent || {}) as Record<string, number>;
-                      const prevTotalAmounts: Record<string, number> = {};
-                      for (const id of Object.keys(prevActuals)) {
-                        prevTotalAmounts[id] = (prevActuals[id] || 0) + (prevRestComps[id] || 0);
-                      }
-                      const prevGrandTotal = Object.values(prevTotalAmounts).reduce((a: number, b: number) => a + b, 0);
-                      return Object.entries(prevTotalAmounts).map(([id, val]) => {
-                        const restShare = prevGrandTotal > 0 ? parseAmount(restAmount) * (val / prevGrandTotal) : 0;
-                        if (restShare < 0.5) return null;
+            <View className="gap-3">
+              <Text className="text-sm font-semibold text-foreground">Rest aus vorheriger Fütterung</Text>
+              <View className="gap-2">
+                <Text className="text-xs text-muted">Von welcher Gruppe?</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                  <View className="flex-row gap-2">
+                    <Pressable
+                      onPress={() => { setRestGroupId('none'); setRestAmount(''); }}
+                      style={({ pressed }) => [{ backgroundColor: restGroupId === 'none' ? colors.primary : colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 8, opacity: pressed ? 0.8 : 1 }]}
+                    >
+                      <Text className={restGroupId === 'none' ? 'font-semibold text-background text-sm' : 'font-medium text-foreground text-sm'}>Kein Rest</Text>
+                    </Pressable>
+                    {allGroups
+                      .filter((g) => lastSessionPerGroup[g.id])
+                      .map((group) => {
+                        const lastSession = lastSessionPerGroup[group.id];
                         return (
-                          <Text key={id} className="text-xs text-muted">{id}: {restShare.toFixed(0)} kg</Text>
+                          <Pressable
+                            key={group.id}
+                            onPress={() => setRestGroupId(group.id)}
+                            style={({ pressed }) => [{ backgroundColor: restGroupId === group.id ? colors.primary : colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 8, opacity: pressed ? 0.8 : 1 }]}
+                          >
+                            <Text className={restGroupId === group.id ? 'font-semibold text-background text-sm' : 'font-medium text-foreground text-sm'}>
+                              {group.name}
+                            </Text>
+                            <Text className={`text-xs ${restGroupId === group.id ? 'text-background' : 'text-muted'}`}>
+                              Letzt.: {(lastSession.totalAmount || 0).toFixed(0)} kg
+                            </Text>
+                          </Pressable>
                         );
-                      });
-                    })()}
+                      })}
                   </View>
-                )}
+                </ScrollView>
               </View>
-            )}
+
+              {restGroupId !== 'none' && (
+                <View className="gap-2">
+                  <View className="flex-row items-center gap-2 px-4 py-3 bg-surface rounded-lg border border-border" style={{ borderColor: colors.border }}>
+                    <TextInput
+                      className="flex-1 text-foreground text-lg font-semibold"
+                      placeholder="0"
+                      placeholderTextColor={colors.muted}
+                      keyboardType="decimal-pad"
+                      value={restAmount}
+                      onChangeText={setRestAmount}
+                    />
+                    <Text className="text-sm text-muted font-medium">kg</Text>
+                  </View>
+
+                  {restKg > 0 && prevSession && (
+                    <View className="p-3 bg-primary/10 rounded-lg border border-primary/20 gap-1">
+                      <Text className="text-xs font-semibold text-foreground">
+                        Geschätzte Zusammensetzung ({allGroups.find(g => g.id === restGroupId)?.name})
+                      </Text>
+                      {(() => {
+                        const prevActuals = prevSession.actualAmounts as Record<string, number>;
+                        const prevRestComps = (prevSession.restPerComponent || {}) as Record<string, number>;
+                        const prevTotalAmounts: Record<string, number> = {};
+                        for (const id of Object.keys(prevActuals)) {
+                          prevTotalAmounts[id] = (prevActuals[id] || 0) + (prevRestComps[id] || 0);
+                        }
+                        const prevGrandTotal = Object.values(prevTotalAmounts).reduce((a: number, b: number) => a + b, 0);
+                        return Object.entries(prevTotalAmounts).map(([id, val]) => {
+                          const restShare = prevGrandTotal > 0 ? restKg * (val / prevGrandTotal) : 0;
+                          if (restShare < 0.5) return null;
+                          return (
+                            <Text key={id} className="text-xs text-muted">{id}: {restShare.toFixed(0)} kg</Text>
+                          );
+                        });
+                      })()}
+                    </View>
+                  )}
+                </View>
+              )}
+            </View>
 
             {orderedComponents.length > 0 && (
               <View className="gap-3">
-                <Text className="text-sm font-semibold text-foreground">Ladereihenfolge anpassen</Text>
+                <View className="flex-row justify-between items-center">
+                  <Text className="text-sm font-semibold text-foreground">Ladereihenfolge</Text>
+                  <Text className="text-xs text-muted">wird automatisch gespeichert</Text>
+                </View>
                 <View className="gap-2">
                   {orderedComponents.map((comp, index) => (
                     <View key={comp.id} className="flex-row items-center gap-2 p-3 bg-surface rounded-lg border border-border" style={{ borderColor: colors.border }}>
@@ -415,8 +479,7 @@ export default function FeedingModeScreen() {
     );
   }
 
-  const currentIndex = completedComponents.length;
-  const currentComponent = orderedComponents[currentIndex];
+  const currentComponent = orderedComponents[completedComponents.length];
   const cumulativeTarget = currentComponent ? getCumulativeTarget(currentComponent.id) : 0;
 
   return (
@@ -434,7 +497,7 @@ export default function FeedingModeScreen() {
           {parseAmount(restAmount) > 0 && (
             <View className="p-3 bg-primary/10 rounded-lg border border-primary/20">
               <Text className="text-xs font-semibold text-foreground">
-                ✓ {parseAmount(restAmount).toFixed(0)} kg Rest bereits eingerechnet – Waage startet bei {parseAmount(restAmount).toFixed(0)} kg
+                ✓ {parseAmount(restAmount).toFixed(0)} kg Rest ({allGroups.find(g => g.id === restGroupId)?.name}) bereits eingerechnet – Waage startet bei {parseAmount(restAmount).toFixed(0)} kg
               </Text>
             </View>
           )}
@@ -457,7 +520,7 @@ export default function FeedingModeScreen() {
               <View className="gap-1 mb-3 p-3 bg-primary/10 rounded-lg">
                 {parseAmount(restAmount) > 0 && (
                   <View className="flex-row justify-between">
-                    <Text className="text-xs text-muted">Rest (bereits vorhanden)</Text>
+                    <Text className="text-xs text-muted">Rest ({allGroups.find(g => g.id === restGroupId)?.name})</Text>
                     <Text className="text-xs text-muted">{parseAmount(restAmount).toFixed(0)} kg ✓</Text>
                   </View>
                 )}
@@ -551,7 +614,7 @@ export default function FeedingModeScreen() {
                 </Text>
                 {parseAmount(restAmount) > 0 && (
                   <Text className="text-xs text-muted text-center">
-                    Rest genutzt: {parseAmount(restAmount).toFixed(0)} kg
+                    Rest genutzt: {parseAmount(restAmount).toFixed(0)} kg ({allGroups.find(g => g.id === restGroupId)?.name})
                   </Text>
                 )}
                 <Text className="text-sm font-bold text-primary text-center">
