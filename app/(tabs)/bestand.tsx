@@ -1,20 +1,9 @@
 import React, { useState, useCallback } from 'react';
-import { ScrollView, Text, View, TextInput, Pressable, Alert, Switch } from 'react-native';
+import { ScrollView, Text, View, TextInput, Pressable, Alert, Switch, ActivityIndicator } from 'react-native';
 import { ScreenContainer } from '@/components/screen-container';
 import { useColors } from '@/hooks/use-colors';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect } from 'expo-router';
-
-const DEFAULT_COMPONENT_NAMES: Record<string, string> = {
-  maissilage: 'Maissilage',
-  grassilage: 'Grassilage',
-  stroh: 'Stroh',
-  ausgleichsfutter: 'Ausgleichsfutter',
-  kraftfutter: 'Kraftfutter',
-  wasser: 'Wasser',
-};
-
-const BESTAND_KEY = 'app:bestand';
+import { getFarmCode, getRations, getInventory, saveInventoryItem } from '@/lib/supabase-service';
 
 interface BestandEntry {
   id: string;
@@ -29,7 +18,6 @@ const parseAmount = (value: string): number => {
   const num = parseFloat(value.replace(',', '.'));
   return isNaN(num) ? 0 : Math.max(0, num);
 };
-
 const formatAmount = (value: number): string => value.toFixed(0);
 
 export default function BestandScreen() {
@@ -38,94 +26,83 @@ export default function BestandScreen() {
   const [editValues, setEditValues] = useState<Record<string, string>>({});
   const [thresholdValues, setThresholdValues] = useState<Record<string, string>>({});
   const [isSaving, setIsSaving] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [farmCode, setFarmCode] = useState<string | null>(null);
 
   const loadData = async () => {
     try {
-      const rationData = await AsyncStorage.getItem('feeding:base_rations');
-      const nameMap: Record<string, string> = { ...DEFAULT_COMPONENT_NAMES };
-      const allComponentIds = new Set<string>(Object.keys(DEFAULT_COMPONENT_NAMES));
+      setIsLoading(true);
+      const code = await getFarmCode();
+      setFarmCode(code);
+      if (!code) return;
 
-      if (rationData) {
-        const rations = JSON.parse(rationData);
-        Object.values(rations).forEach((ration: any) => {
-          if (ration.componentDefs) {
-            ration.componentDefs.forEach((comp: any) => {
-              nameMap[comp.id] = comp.name;
-              allComponentIds.add(comp.id);
-            });
-          }
-        });
-      }
+      // Alle Komponenten aus allen Rationen sammeln
+      const rations = await getRations(code);
+      const nameMap: Record<string, string> = {};
+      const allComponentIds = new Set<string>();
+      Object.values(rations).forEach((ration: any) => {
+        if (ration.componentDefs) {
+          ration.componentDefs.forEach((comp: any) => {
+            nameMap[comp.id] = comp.name;
+            allComponentIds.add(comp.id);
+          });
+        }
+      });
 
-      const bestandData = await AsyncStorage.getItem(BESTAND_KEY);
-      const existing: Record<string, BestandEntry> = bestandData ? JSON.parse(bestandData) : {};
+      const existing = await getInventory(code);
 
       const merged: BestandEntry[] = Array.from(allComponentIds).map((id) => {
-        if (existing[id]) {
-          return {
-            ...existing[id],
-            name: nameMap[id] || existing[id].name,
-            tracked: existing[id].tracked ?? false,
-          };
-        }
-        return {
-          id,
-          name: nameMap[id] || id,
-          tracked: false,
-          currentStock: 0,
-          warningEnabled: false,
-          warningThreshold: 100,
-        };
+        if (existing[id]) return { ...existing[id], name: nameMap[id] || existing[id].name };
+        return { id, name: nameMap[id] || id, tracked: false, currentStock: 0, warningEnabled: false, warningThreshold: 100 };
       });
 
-      merged.sort((a, b) => {
-        if (a.tracked !== b.tracked) return a.tracked ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      });
-
+      merged.sort((a, b) => { if (a.tracked !== b.tracked) return a.tracked ? -1 : 1; return a.name.localeCompare(b.name); });
       setEntries(merged);
+
       const ev: Record<string, string> = {};
       const tv: Record<string, string> = {};
-      merged.forEach((e) => {
-        ev[e.id] = e.currentStock.toString();
-        tv[e.id] = e.warningThreshold.toString();
-      });
+      merged.forEach((e) => { ev[e.id] = e.currentStock.toString(); tv[e.id] = e.warningThreshold.toString(); });
       setEditValues(ev);
       setThresholdValues(tv);
     } catch (error) { console.error('Error loading bestand:', error); }
+    finally { setIsLoading(false); }
   };
 
   useFocusEffect(useCallback(() => { loadData(); }, []));
 
   const handleSave = async () => {
+    if (!farmCode) return;
     setIsSaving(true);
     try {
-      const updated = entries.map((e) => ({
-        ...e,
-        currentStock: parseAmount(editValues[e.id] || '0'),
-        warningThreshold: parseAmount(thresholdValues[e.id] || '100'),
-      }));
-      const toStore: Record<string, BestandEntry> = {};
-      updated.forEach((e) => { toStore[e.id] = e; });
-      await AsyncStorage.setItem(BESTAND_KEY, JSON.stringify(toStore));
-      setEntries(updated);
+      for (const entry of entries) {
+        await saveInventoryItem(farmCode, {
+          ...entry,
+          currentStock: parseAmount(editValues[entry.id] || '0'),
+          warningThreshold: parseAmount(thresholdValues[entry.id] || '100'),
+        });
+      }
       Alert.alert('Erfolg', 'Bestand gespeichert');
     } catch { Alert.alert('Fehler', 'Bestand konnte nicht gespeichert werden'); }
     finally { setIsSaving(false); }
   };
 
-  const toggleTracked = (id: string) => {
-    setEntries((prev) => prev.map((e) => e.id === id ? { ...e, tracked: !e.tracked } : e));
-  };
-
-  const toggleWarning = (id: string) => {
-    setEntries((prev) => prev.map((e) => e.id === id ? { ...e, warningEnabled: !e.warningEnabled } : e));
-  };
+  const toggleTracked = (id: string) => setEntries((prev) => prev.map((e) => e.id === id ? { ...e, tracked: !e.tracked } : e));
+  const toggleWarning = (id: string) => setEntries((prev) => prev.map((e) => e.id === id ? { ...e, warningEnabled: !e.warningEnabled } : e));
 
   const trackedEntries = entries.filter((e) => e.tracked);
   const untrackedEntries = entries.filter((e) => !e.tracked);
-
   const warnings = trackedEntries.filter((e) => e.warningEnabled && parseAmount(editValues[e.id] || '0') <= e.warningThreshold);
+
+  if (isLoading) {
+    return (
+      <ScreenContainer className="p-6">
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', gap: 12 }}>
+          <ActivityIndicator size="large" color={colors.primary} />
+          <Text style={{ color: colors.muted }}>Lade Bestand...</Text>
+        </View>
+      </ScreenContainer>
+    );
+  }
 
   return (
     <ScreenContainer className="p-6">
@@ -158,51 +135,26 @@ export default function BestandScreen() {
                     <View className="flex-row justify-between items-center">
                       <Text className="text-sm font-bold text-foreground">{entry.name}</Text>
                       <View className="flex-row items-center gap-2">
-                        {isLow && <Text style={{ color: '#f59e0b', fontSize: 12, fontWeight: '600' }}>⚠️ Niedrig</Text>}
-                        <Switch
-                          value={entry.tracked}
-                          onValueChange={() => toggleTracked(entry.id)}
-                          trackColor={{ false: colors.border, true: colors.primary }}
-                        />
+                        {isLow && <Text style={{ color: '#f59e0b', fontSize: 12, fontWeight: '600' }}>⚠️</Text>}
+                        <Switch value={entry.tracked} onValueChange={() => toggleTracked(entry.id)} trackColor={{ false: colors.border, true: colors.primary }} />
                       </View>
                     </View>
-
                     <View className="gap-1">
                       <Text className="text-xs text-muted">Aktueller Bestand</Text>
                       <View className="flex-row items-center gap-2 px-3 py-2 bg-background rounded-lg border" style={{ borderColor: colors.border }}>
-                        <TextInput
-                          className="flex-1 text-foreground text-base font-semibold"
-                          placeholder="0"
-                          placeholderTextColor={colors.muted}
-                          keyboardType="decimal-pad"
-                          value={editValues[entry.id] || ''}
-                          onChangeText={(v) => setEditValues((prev) => ({ ...prev, [entry.id]: v }))}
-                        />
+                        <TextInput className="flex-1 text-foreground text-base font-semibold" placeholder="0" placeholderTextColor={colors.muted} keyboardType="decimal-pad" value={editValues[entry.id] || ''} onChangeText={(v) => setEditValues((prev) => ({ ...prev, [entry.id]: v }))} />
                         <Text className="text-sm text-muted">kg</Text>
                       </View>
                     </View>
-
                     <View className="flex-row justify-between items-center">
                       <Text className="text-xs text-muted">Warnung aktivieren</Text>
-                      <Switch
-                        value={entry.warningEnabled}
-                        onValueChange={() => toggleWarning(entry.id)}
-                        trackColor={{ false: colors.border, true: colors.primary }}
-                      />
+                      <Switch value={entry.warningEnabled} onValueChange={() => toggleWarning(entry.id)} trackColor={{ false: colors.border, true: colors.primary }} />
                     </View>
-
                     {entry.warningEnabled && (
                       <View className="gap-1">
                         <Text className="text-xs text-muted">Warnschwelle</Text>
                         <View className="flex-row items-center gap-2 px-3 py-2 bg-background rounded-lg border" style={{ borderColor: colors.primary }}>
-                          <TextInput
-                            className="flex-1 text-foreground text-base"
-                            placeholder="100"
-                            placeholderTextColor={colors.muted}
-                            keyboardType="decimal-pad"
-                            value={thresholdValues[entry.id] || ''}
-                            onChangeText={(v) => setThresholdValues((prev) => ({ ...prev, [entry.id]: v }))}
-                          />
+                          <TextInput className="flex-1 text-foreground text-base" placeholder="100" placeholderTextColor={colors.muted} keyboardType="decimal-pad" value={thresholdValues[entry.id] || ''} onChangeText={(v) => setThresholdValues((prev) => ({ ...prev, [entry.id]: v }))} />
                           <Text className="text-sm text-muted">kg</Text>
                         </View>
                       </View>
@@ -216,34 +168,23 @@ export default function BestandScreen() {
           {untrackedEntries.length > 0 && (
             <View className="gap-2">
               <Text className="text-xs font-semibold text-muted uppercase">Nicht verfolgt</Text>
-              <Text className="text-xs text-muted">Aktiviere den Schalter, um eine Komponente in die Bestandsverwaltung aufzunehmen.</Text>
+              <Text className="text-xs text-muted">Aktiviere den Schalter um eine Komponente zu verfolgen.</Text>
               {untrackedEntries.map((entry) => (
                 <View key={entry.id} className="flex-row justify-between items-center p-3 rounded-lg border" style={{ borderColor: colors.border, backgroundColor: colors.surface }}>
                   <Text className="text-sm font-medium text-foreground">{entry.name}</Text>
-                  <Switch
-                    value={entry.tracked}
-                    onValueChange={() => toggleTracked(entry.id)}
-                    trackColor={{ false: colors.border, true: colors.primary }}
-                  />
+                  <Switch value={entry.tracked} onValueChange={() => toggleTracked(entry.id)} trackColor={{ false: colors.border, true: colors.primary }} />
                 </View>
               ))}
             </View>
           )}
 
-          <Pressable
-            onPress={handleSave}
-            disabled={isSaving}
-            style={({ pressed }) => [{ backgroundColor: colors.primary, borderRadius: 8, padding: 16, opacity: pressed || isSaving ? 0.8 : 1 }]}
-          >
-            <Text className="text-center font-semibold text-background text-base">
-              {isSaving ? 'Speichert...' : 'Bestand speichern'}
-            </Text>
+          <Pressable onPress={handleSave} disabled={isSaving}
+            style={({ pressed }) => [{ backgroundColor: colors.primary, borderRadius: 8, padding: 16, opacity: pressed || isSaving ? 0.8 : 1 }]}>
+            <Text className="text-center font-semibold text-background text-base">{isSaving ? 'Speichert...' : 'Bestand speichern'}</Text>
           </Pressable>
 
           <View className="p-4 bg-primary/10 rounded-lg border border-primary/20">
-            <Text className="text-xs text-foreground font-medium">
-              💡 Nur verfolgte Komponenten werden nach jeder Fütterung automatisch abgezogen. Vergiss nicht zu speichern!
-            </Text>
+            <Text className="text-xs text-foreground font-medium">💡 Nur verfolgte Komponenten werden nach jeder Fütterung automatisch abgezogen.</Text>
           </View>
         </View>
       </ScrollView>

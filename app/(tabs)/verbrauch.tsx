@@ -1,25 +1,9 @@
-import React, { useState, useEffect } from 'react';
-import { ScrollView, Text, View, Pressable } from 'react-native';
+import React, { useState, useCallback } from 'react';
+import { ScrollView, Text, View, Pressable, ActivityIndicator } from 'react-native';
 import { ScreenContainer } from '@/components/screen-container';
 import { useColors } from '@/hooks/use-colors';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-
-const DEFAULT_ANIMAL_GROUPS = [
-  { id: 'milchkuehe', name: 'Milchkühe' },
-  { id: 'fresser', name: 'Fresser' },
-  { id: 'bullen', name: 'Bullen' },
-];
-
-const DEFAULT_COMPONENT_NAMES: Record<string, string> = {
-  maissilage: 'Maissilage',
-  grassilage: 'Grassilage',
-  stroh: 'Stroh',
-  ausgleichsfutter: 'Ausgleichsfutter',
-  kraftfutter: 'Kraftfutter',
-  wasser: 'Wasser',
-};
-
-const GROUPS_KEY = 'app:animal_groups';
+import { useFocusEffect } from 'expo-router';
+import { getFarmCode, getAnimalGroups, getFeedingLogs } from '@/lib/supabase-service';
 
 const TIME_RANGES = [
   { id: '7', label: '7 Tage' },
@@ -39,42 +23,26 @@ interface ComponentStat {
 
 export default function VerbrauchScreen() {
   const colors = useColors();
-  const [animalGroups, setAnimalGroups] = useState(DEFAULT_ANIMAL_GROUPS);
+  const [animalGroups, setAnimalGroups] = useState<{ id: string; name: string }[]>([]);
   const [selectedGroupId, setSelectedGroupId] = useState('all');
   const [selectedTimeRange, setSelectedTimeRange] = useState('30');
-  const [componentNameMap, setComponentNameMap] = useState<Record<string, string>>(DEFAULT_COMPONENT_NAMES);
   const [stats, setStats] = useState<ComponentStat[]>([]);
   const [feedingCount, setFeedingCount] = useState(0);
   const [daysCovered, setDaysCovered] = useState(0);
+  const [isLoading, setIsLoading] = useState(true);
 
   const loadData = async () => {
     try {
-      const groupData = await AsyncStorage.getItem(GROUPS_KEY);
-      const groups = groupData ? JSON.parse(groupData) : DEFAULT_ANIMAL_GROUPS;
+      setIsLoading(true);
+      const code = await getFarmCode();
+      if (!code) return;
+
+      const groups = await getAnimalGroups(code);
       setAnimalGroups(groups);
 
-      const rationData = await AsyncStorage.getItem('feeding:base_rations');
-      const nameMap: Record<string, string> = { ...DEFAULT_COMPONENT_NAMES };
-      if (rationData) {
-        const rations = JSON.parse(rationData);
-        Object.values(rations).forEach((ration: any) => {
-          if (ration.componentDefs) {
-            ration.componentDefs.forEach((comp: any) => { nameMap[comp.id] = comp.name; });
-          }
-        });
-      }
-      setComponentNameMap(nameMap);
+      const allLogs = await getFeedingLogs(code, selectedGroupId !== 'all' ? selectedGroupId : undefined);
 
-      let combined: any[] = [];
-      for (const group of groups) {
-        const data = await AsyncStorage.getItem(`logs_${group.id}`);
-        if (data) combined = [...combined, ...JSON.parse(data)];
-      }
-
-      let filtered = combined;
-      if (selectedGroupId !== 'all') {
-        filtered = filtered.filter((log) => log.animalGroupId === selectedGroupId);
-      }
+      let filtered = allLogs;
       if (selectedTimeRange !== 'all') {
         const cutoff = Date.now() - parseInt(selectedTimeRange) * 24 * 60 * 60 * 1000;
         filtered = filtered.filter((log) => log.timestamp >= cutoff);
@@ -98,30 +66,36 @@ export default function VerbrauchScreen() {
         });
       });
 
-      const result: ComponentStat[] = Object.entries(componentTotals)
-        .map(([key, total]) => {
-          const count = componentCounts[key] || 1;
-          const avgPerDay = total / days;
-          return {
-            name: nameMap[key] || key,
-            totalActual: total,
-            feedingCount: count,
-            avgPerFeeding: total / count,
-            perWeek: avgPerDay * 7,
-            perMonth: avgPerDay * 30,
-          };
-        })
-        .sort((a, b) => b.totalActual - a.totalActual);
+      const result: ComponentStat[] = Object.entries(componentTotals).map(([key, total]) => {
+        const count = componentCounts[key] || 1;
+        const avgPerDay = total / days;
+        return { name: key, totalActual: total, feedingCount: count, avgPerFeeding: total / count, perWeek: avgPerDay * 7, perMonth: avgPerDay * 30 };
+      }).sort((a, b) => b.totalActual - a.totalActual);
 
       setStats(result);
-    } catch (error) { console.error('Error loading data:', error); }
+    } catch (error) {
+      console.error('Error loading verbrauch:', error);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
-  useEffect(() => { loadData(); }, [selectedGroupId, selectedTimeRange]);
+  useFocusEffect(useCallback(() => { loadData(); }, [selectedGroupId, selectedTimeRange]));
 
   const totalPerWeek = stats.reduce((sum, s) => sum + s.perWeek, 0);
   const totalPerMonth = stats.reduce((sum, s) => sum + s.perMonth, 0);
   const totalActual = stats.reduce((sum, s) => sum + s.totalActual, 0);
+
+  if (isLoading) {
+    return (
+      <ScreenContainer className="p-6">
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', gap: 12 }}>
+          <ActivityIndicator size="large" color={colors.primary} />
+          <Text style={{ color: colors.muted }}>Lade Verbrauch...</Text>
+        </View>
+      </ScreenContainer>
+    );
+  }
 
   return (
     <ScreenContainer className="p-6">
@@ -168,11 +142,7 @@ export default function VerbrauchScreen() {
               <View className="gap-2">
                 <Text className="text-xs font-semibold text-muted uppercase">Übersicht</Text>
                 <View className="flex-row gap-3">
-                  {[
-                    { value: feedingCount.toString(), label: 'Fütterungen' },
-                    { value: daysCovered.toString(), label: 'Tage Daten' },
-                    { value: totalActual.toFixed(0), label: 'kg gesamt' },
-                  ].map((s) => (
+                  {[{ value: feedingCount.toString(), label: 'Fütterungen' }, { value: daysCovered.toString(), label: 'Tage Daten' }, { value: totalActual.toFixed(0), label: 'kg gesamt' }].map((s) => (
                     <View key={s.label} className="flex-1 p-3 bg-primary/10 rounded-lg border border-primary/20 items-center">
                       <Text className="text-xl font-bold text-primary">{s.value}</Text>
                       <Text className="text-xs text-muted text-center">{s.label}</Text>
@@ -184,11 +154,11 @@ export default function VerbrauchScreen() {
               <View className="flex-row gap-3">
                 <View className="flex-1 p-4 bg-surface rounded-lg border border-border items-center gap-1">
                   <Text className="text-2xl font-bold text-foreground">{totalPerWeek.toFixed(0)} kg</Text>
-                  <Text className="text-xs text-muted">Ø pro Woche (gesamt)</Text>
+                  <Text className="text-xs text-muted">Ø pro Woche</Text>
                 </View>
                 <View className="flex-1 p-4 bg-surface rounded-lg border border-border items-center gap-1">
                   <Text className="text-2xl font-bold text-foreground">{totalPerMonth.toFixed(0)} kg</Text>
-                  <Text className="text-xs text-muted">Ø pro Monat (gesamt)</Text>
+                  <Text className="text-xs text-muted">Ø pro Monat</Text>
                 </View>
               </View>
 
@@ -222,7 +192,7 @@ export default function VerbrauchScreen() {
 
               <View className="p-4 bg-primary/10 rounded-lg border border-primary/20">
                 <Text className="text-xs text-foreground font-medium">
-                  💡 Die Werte basieren auf {feedingCount} Fütterungen über {daysCovered} Tage. Je mehr Protokolleinträge vorhanden sind, desto genauer die Hochrechnung.
+                  💡 Basiert auf {feedingCount} Fütterungen über {daysCovered} Tage.
                 </Text>
               </View>
             </>

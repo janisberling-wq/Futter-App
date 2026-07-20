@@ -1,58 +1,15 @@
 import React, { useState, useEffect } from 'react';
-import { ScrollView, Text, View, TextInput, Pressable, Alert } from 'react-native';
+import { ScrollView, Text, View, TextInput, Pressable, Alert, ActivityIndicator } from 'react-native';
 import { ScreenContainer } from '@/components/screen-container';
 import { useColors } from '@/hooks/use-colors';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import {
+  getFarmCode, getAnimalGroups, getRations, getFeedingLogs,
+  saveFeedingLog, saveFeedingOrder, getFeedingOrder, getInventory, updateInventoryStock
+} from '@/lib/supabase-service';
 
-type AnimalGroupId = string;
-
-interface FeedingComponent {
-  id: string;
-  name: string;
-}
-
-interface BaseRation {
-  animalGroupId: string;
-  components: Record<string, number>;
-  componentDefs?: FeedingComponent[];
-  lastUpdated: number;
-}
-
-interface FeedingSession {
-  id: string;
-  animalGroupId: AnimalGroupId;
-  timestamp: number;
-  totalAmount: number;
-  freshAmount?: number;
-  restAmount?: number;
-  restPerComponent?: Record<string, number>;
-  plannedAmounts: Record<string, number>;
-  actualAmounts: Record<string, number>;
-  completed: boolean;
-}
-
-interface AnimalGroup {
-  id: string;
-  name: string;
-}
-
-const DEFAULT_ANIMAL_GROUPS: AnimalGroup[] = [
-  { id: 'milchkuehe', name: 'Milchkühe' },
-  { id: 'fresser', name: 'Fresser' },
-  { id: 'bullen', name: 'Bullen' },
-];
-
-const DEFAULT_FEEDING_COMPONENTS: FeedingComponent[] = [
-  { id: 'maissilage', name: 'Maissilage' },
-  { id: 'grassilage', name: 'Grassilage' },
-  { id: 'stroh', name: 'Stroh' },
-  { id: 'ausgleichsfutter', name: 'Ausgleichsfutter' },
-  { id: 'kraftfutter', name: 'Kraftfutter' },
-  { id: 'wasser', name: 'Wasser' },
-];
-
-const GROUPS_KEY = 'app:animal_groups';
+interface FeedingComponent { id: string; name: string; }
+interface AnimalGroup { id: string; name: string; }
 
 const parseAmount = (value: string): number => parseFloat(value.replace(',', '.')) || 0;
 const formatAmount = (value: number): string => value.toFixed(2);
@@ -63,31 +20,27 @@ const calculateTotalRation = (components: Record<string, number>): number =>
   Object.values(components).reduce((a, b) => a + b, 0);
 const generateId = (): string => Date.now().toString();
 
-const calculatePlannedAmounts = (
-  baseComponents: Record<string, number>,
-  totalAmount: number
-): Record<string, number> => {
+const calculatePlannedAmounts = (baseComponents: Record<string, number>, totalAmount: number): Record<string, number> => {
   const total = calculateTotalRation(baseComponents);
   if (total === 0) return {};
-  return Object.fromEntries(
-    Object.entries(baseComponents).map(([key, value]) => [key, (value / total) * totalAmount])
-  );
+  return Object.fromEntries(Object.entries(baseComponents).map(([key, value]) => [key, (value / total) * totalAmount]));
 };
 
+// Nur Leitkomponenten bestimmen die Tieranzahl
 const calcAverageAnimalCount = (
   completedIds: string[],
   actualAmounts: Record<string, number>,
   restPerComponent: Record<string, number>,
-  baseRationPerAnimal: Record<string, number>
+  baseRationPerAnimal: Record<string, number>,
+  leadComponentIds: string[]
 ): number => {
-  const counts = completedIds
-    .filter((id) => (baseRationPerAnimal[id] || 0) > 0)
-    .map((id) => {
-      const fresh = actualAmounts[id] || 0;
-      const rest = restPerComponent[id] || 0;
-      return (fresh + rest) / baseRationPerAnimal[id];
-    });
-  if (counts.length === 0) return 0;
+  const leadCompleted = completedIds.filter(id => leadComponentIds.includes(id) && (baseRationPerAnimal[id] || 0) > 0);
+  if (leadCompleted.length === 0) return 0;
+  const counts = leadCompleted.map(id => {
+    const fresh = actualAmounts[id] || 0;
+    const rest = restPerComponent[id] || 0;
+    return (fresh + rest) / baseRationPerAnimal[id];
+  });
   return counts.reduce((a, b) => a + b, 0) / counts.length;
 };
 
@@ -96,72 +49,75 @@ export default function FeedingModeScreen() {
   const router = useRouter();
   const { groupId } = useLocalSearchParams<{ groupId: string }>();
 
-  const selectedGroupId = groupId || 'milchkuehe';
-  const [allGroups, setAllGroups] = useState<AnimalGroup[]>(DEFAULT_ANIMAL_GROUPS);
-  const selectedGroup = allGroups.find((g) => g.id === selectedGroupId);
-
-  const [currentRation, setCurrentRation] = useState<BaseRation | null>(null);
+  const selectedGroupId = groupId || '';
+  const [farmCode, setFarmCode] = useState<string | null>(null);
+  const [allGroups, setAllGroups] = useState<AnimalGroup[]>([]);
+  const [currentRation, setCurrentRation] = useState<any>(null);
   const [activeComponents, setActiveComponents] = useState<FeedingComponent[]>([]);
   const [orderedComponents, setOrderedComponents] = useState<FeedingComponent[]>([]);
   const [baseRationPerAnimal, setBaseRationPerAnimal] = useState<Record<string, number>>({});
-
-  const [lastSessionPerGroup, setLastSessionPerGroup] = useState<Record<string, FeedingSession>>({});
+  const [leadComponentIds, setLeadComponentIds] = useState<string[]>([]);
+  const [lastSessionPerGroup, setLastSessionPerGroup] = useState<Record<string, any>>({});
   const [restGroupId, setRestGroupId] = useState<string>('none');
+  const [isLoading, setIsLoading] = useState(true);
+
   const prevSession = restGroupId !== 'none' ? lastSessionPerGroup[restGroupId] : null;
+  const selectedGroup = allGroups.find((g) => g.id === selectedGroupId);
 
   useEffect(() => {
     const load = async () => {
       try {
-        const groupData = await AsyncStorage.getItem(GROUPS_KEY);
-        const groups: AnimalGroup[] = groupData ? JSON.parse(groupData) : DEFAULT_ANIMAL_GROUPS;
+        setIsLoading(true);
+        const code = await getFarmCode();
+        setFarmCode(code);
+        if (!code) return;
+
+        const groups = await getAnimalGroups(code);
         setAllGroups(groups);
 
-        const data = await AsyncStorage.getItem('feeding:base_rations');
-        if (data) {
-          const rations = JSON.parse(data);
-          const ration = rations[selectedGroupId] || null;
-          setCurrentRation(ration);
-          if (ration) {
-            const defs = ration.componentDefs || DEFAULT_FEEDING_COMPONENTS;
-            const active = defs.filter((c: FeedingComponent) => (ration.components[c.id] || 0) > 0);
+        const rations = await getRations(code);
+        const ration = rations[selectedGroupId] || null;
+        setCurrentRation(ration);
 
-            // Gespeicherte Reihenfolge laden
-            const savedOrderData = await AsyncStorage.getItem(`feeding:order_${selectedGroupId}`);
-            if (savedOrderData) {
-              const savedIds: string[] = JSON.parse(savedOrderData);
-              const ordered: FeedingComponent[] = [];
-              for (const id of savedIds) {
-                const comp = active.find((c: FeedingComponent) => c.id === id);
-                if (comp) ordered.push(comp);
-              }
-              for (const comp of active) {
-                if (!ordered.find((c) => c.id === comp.id)) ordered.push(comp);
-              }
-              setOrderedComponents(ordered);
-            } else {
-              setOrderedComponents(active);
+        if (ration) {
+          const defs = ration.componentDefs || [];
+          const active = defs.filter((c: FeedingComponent) => (ration.components[c.id] || 0) > 0);
+          const leads = ration.leadComponentIds || active.map((c: FeedingComponent) => c.id);
+          setLeadComponentIds(leads);
+
+          const savedOrderIds = await getFeedingOrder(code, selectedGroupId);
+          if (savedOrderIds) {
+            const ordered: FeedingComponent[] = [];
+            for (const id of savedOrderIds) {
+              const comp = active.find((c: FeedingComponent) => c.id === id);
+              if (comp) ordered.push(comp);
             }
-            setActiveComponents(active);
-
-            const perAnimal: Record<string, number> = {};
             for (const comp of active) {
-              perAnimal[comp.id] = ration.components[comp.id] || 0;
+              if (!ordered.find((c) => c.id === comp.id)) ordered.push(comp);
             }
-            setBaseRationPerAnimal(perAnimal);
+            setOrderedComponents(ordered);
+          } else {
+            setOrderedComponents(active);
           }
+          setActiveComponents(active);
+
+          const perAnimal: Record<string, number> = {};
+          for (const comp of active) perAnimal[comp.id] = ration.components[comp.id] || 0;
+          setBaseRationPerAnimal(perAnimal);
         }
 
-        // Letzte Fütterung pro Gruppe laden
-        const lastSessions: Record<string, FeedingSession> = {};
+        // Letzte Fütterungen pro Gruppe
+        const lastSessions: Record<string, any> = {};
         for (const group of groups) {
-          const logsData = await AsyncStorage.getItem(`logs_${group.id}`);
-          if (logsData) {
-            const logs: FeedingSession[] = JSON.parse(logsData);
-            if (logs.length > 0) lastSessions[group.id] = logs[logs.length - 1];
-          }
+          const logs = await getFeedingLogs(code, group.id);
+          if (logs.length > 0) lastSessions[group.id] = logs[0]; // already sorted desc
         }
         setLastSessionPerGroup(lastSessions);
-      } catch (error) { console.error('Error loading ration:', error); }
+      } catch (error) {
+        Alert.alert('Fehler', 'Daten konnten nicht geladen werden');
+      } finally {
+        setIsLoading(false);
+      }
     };
     load();
   }, [selectedGroupId]);
@@ -183,10 +139,7 @@ export default function FeedingModeScreen() {
     [newOrder[index], newOrder[swapIndex]] = [newOrder[swapIndex], newOrder[index]];
     setOrderedComponents(newOrder);
     try {
-      await AsyncStorage.setItem(
-        `feeding:order_${selectedGroupId}`,
-        JSON.stringify(newOrder.map((c) => c.id))
-      );
+      if (farmCode) await saveFeedingOrder(farmCode, selectedGroupId, newOrder.map((c) => c.id));
     } catch { console.error('Failed to save order'); }
   };
 
@@ -196,9 +149,7 @@ export default function FeedingModeScreen() {
     if (orderedComponents.length === 0) { Alert.alert('Fehler', 'Keine Komponenten mit Menge > 0 gefunden'); return; }
 
     const total = parseAmount(totalAmount);
-    const activeRationComponents = Object.fromEntries(
-      orderedComponents.map((c) => [c.id, currentRation.components[c.id] || 0])
-    );
+    const activeRationComponents = Object.fromEntries(orderedComponents.map((c) => [c.id, currentRation.components[c.id] || 0]));
     const planned = calculatePlannedAmounts(activeRationComponents, total);
 
     const restKg = parseAmount(restAmount);
@@ -212,9 +163,7 @@ export default function FeedingModeScreen() {
       }
       const prevGrandTotal = Object.values(prevTotalAmounts).reduce((a: number, b: number) => a + b, 0);
       if (prevGrandTotal > 0) {
-        restComps = Object.fromEntries(
-          Object.entries(prevTotalAmounts).map(([id, val]) => [id, restKg * (val / prevGrandTotal)])
-        );
+        restComps = Object.fromEntries(Object.entries(prevTotalAmounts).map(([id, val]) => [id, restKg * (val / prevGrandTotal)]));
       }
     }
     setRestPerComponent(restComps);
@@ -230,8 +179,7 @@ export default function FeedingModeScreen() {
     setIsStarted(true);
   };
 
-  const getCumulativeActual = (): number =>
-    completedComponents.reduce((sum, id) => sum + (actualAmounts[id] || 0), 0);
+  const getCumulativeActual = (): number => completedComponents.reduce((sum, id) => sum + (actualAmounts[id] || 0), 0);
 
   const getCumulativeTarget = (componentId: string): number => {
     const restKg = parseAmount(restAmount);
@@ -252,26 +200,16 @@ export default function FeedingModeScreen() {
       return;
     }
 
-    const remainingIds = orderedComponents
-      .map((c) => c.id)
-      .filter((id) => !completedComponents.includes(id) && id !== componentId);
-
+    const remainingIds = orderedComponents.map((c) => c.id).filter((id) => !completedComponents.includes(id) && id !== componentId);
     const updatedActuals = { ...actualAmounts, [componentId]: actualAmount };
     const updatedCompleted = [...completedComponents, componentId];
 
-    const avgAnimals = calcAverageAnimalCount(
-      updatedCompleted,
-      updatedActuals,
-      restPerComponent,
-      baseRationPerAnimal
-    );
+    // Nur Leitkomponenten bestimmen die Tieranzahl
+    const avgAnimals = calcAverageAnimalCount(updatedCompleted, updatedActuals, restPerComponent, baseRationPerAnimal, leadComponentIds);
 
     if (remainingIds.length > 0 && avgAnimals > 0) {
       const newAmounts = Object.fromEntries(
-        remainingIds.map((id) => [
-          id,
-          Math.max(0, avgAnimals * (baseRationPerAnimal[id] || 0) - (restPerComponent[id] || 0))
-        ])
+        remainingIds.map((id) => [id, Math.max(0, avgAnimals * (baseRationPerAnimal[id] || 0) - (restPerComponent[id] || 0))])
       );
       setPlannedAmounts((prev) => ({ ...prev, ...newAmounts }));
     }
@@ -282,11 +220,12 @@ export default function FeedingModeScreen() {
 
   const handleSave = async () => {
     if (completedComponents.length !== orderedComponents.length) { Alert.alert('Fehler', 'Bitte füttere alle Komponenten'); return; }
+    if (!farmCode) return;
     setIsSaving(true);
     try {
       const restKg = parseAmount(restAmount);
       const freshTotal = getCumulativeActual();
-      const session: FeedingSession = {
+      const session = {
         id: generateId(),
         animalGroupId: selectedGroupId,
         timestamp: Date.now(),
@@ -298,29 +237,36 @@ export default function FeedingModeScreen() {
         actualAmounts,
         completed: true,
       };
-      const logs = await AsyncStorage.getItem(`logs_${selectedGroupId}`);
-      const existingLogs = logs ? JSON.parse(logs) : [];
-      await AsyncStorage.setItem(`logs_${selectedGroupId}`, JSON.stringify([...existingLogs, session]));
+      await saveFeedingLog(farmCode, session);
 
+      // Bestand abziehen
       try {
-        const bestandData = await AsyncStorage.getItem('app:bestand');
-        if (bestandData) {
-          const bestand = JSON.parse(bestandData);
-          for (const [compId, amount] of Object.entries(actualAmounts)) {
-            if (bestand[compId] && bestand[compId].tracked) {
-              bestand[compId].currentStock = Math.max(0, (bestand[compId].currentStock || 0) - (amount as number));
-            }
+        const inventory = await getInventory(farmCode);
+        for (const [compId, amount] of Object.entries(actualAmounts)) {
+          if (inventory[compId] && inventory[compId].tracked) {
+            const newStock = Math.max(0, (inventory[compId].currentStock || 0) - (amount as number));
+            await updateInventoryStock(farmCode, compId, newStock);
           }
-          await AsyncStorage.setItem('app:bestand', JSON.stringify(bestand));
         }
       } catch { console.error('Bestand update failed'); }
 
-      Alert.alert('Erfolg', `Fütterung gespeichert!\nFrisch: ${formatAmount(freshTotal)} kg${restKg > 0 ? `\nRest genutzt: ${formatAmount(restKg)} kg\nGesamt: ${formatAmount(freshTotal + restKg)} kg` : ''}`, [
+      Alert.alert('Erfolg', `Fütterung gespeichert!\nFrisch: ${formatAmount(freshTotal)} kg${restKg > 0 ? `\nRest: ${formatAmount(restKg)} kg\nGesamt: ${formatAmount(freshTotal + restKg)} kg` : ''}`, [
         { text: 'OK', onPress: () => router.back() },
       ]);
     } catch { Alert.alert('Fehler', 'Fütterung konnte nicht gespeichert werden'); }
     finally { setIsSaving(false); }
   };
+
+  if (isLoading) {
+    return (
+      <ScreenContainer className="p-6">
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', gap: 12 }}>
+          <ActivityIndicator size="large" color={colors.primary} />
+          <Text style={{ color: colors.muted }}>Lade Daten...</Text>
+        </View>
+      </ScreenContainer>
+    );
+  }
 
   if (!isStarted) {
     const restKg = parseAmount(restAmount);
@@ -348,122 +294,83 @@ export default function FeedingModeScreen() {
               </View>
             </View>
 
+            {/* Rest */}
             <View className="gap-3">
               <Text className="text-sm font-semibold text-foreground">Rest aus vorheriger Fütterung</Text>
-              <View className="gap-2">
-                <Text className="text-xs text-muted">Von welcher Gruppe?</Text>
-                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                  <View className="flex-row gap-2">
+              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                <View className="flex-row gap-2">
+                  <Pressable
+                    onPress={() => { setRestGroupId('none'); setRestAmount(''); }}
+                    style={({ pressed }) => [{ backgroundColor: restGroupId === 'none' ? colors.primary : colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 8, opacity: pressed ? 0.8 : 1 }]}
+                  >
+                    <Text className={restGroupId === 'none' ? 'font-semibold text-background text-sm' : 'font-medium text-foreground text-sm'}>Kein Rest</Text>
+                  </Pressable>
+                  {allGroups.filter((g) => lastSessionPerGroup[g.id]).map((group) => (
                     <Pressable
-                      onPress={() => { setRestGroupId('none'); setRestAmount(''); }}
-                      style={({ pressed }) => [{ backgroundColor: restGroupId === 'none' ? colors.primary : colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 8, opacity: pressed ? 0.8 : 1 }]}
+                      key={group.id}
+                      onPress={() => setRestGroupId(group.id)}
+                      style={({ pressed }) => [{ backgroundColor: restGroupId === group.id ? colors.primary : colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 8, opacity: pressed ? 0.8 : 1 }]}
                     >
-                      <Text className={restGroupId === 'none' ? 'font-semibold text-background text-sm' : 'font-medium text-foreground text-sm'}>Kein Rest</Text>
+                      <Text className={restGroupId === group.id ? 'font-semibold text-background text-sm' : 'font-medium text-foreground text-sm'}>{group.name}</Text>
+                      <Text className={`text-xs ${restGroupId === group.id ? 'text-background' : 'text-muted'}`}>
+                        {(lastSessionPerGroup[group.id].totalAmount || 0).toFixed(0)} kg
+                      </Text>
                     </Pressable>
-                    {allGroups
-                      .filter((g) => lastSessionPerGroup[g.id])
-                      .map((group) => {
-                        const lastSession = lastSessionPerGroup[group.id];
-                        return (
-                          <Pressable
-                            key={group.id}
-                            onPress={() => setRestGroupId(group.id)}
-                            style={({ pressed }) => [{ backgroundColor: restGroupId === group.id ? colors.primary : colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 8, opacity: pressed ? 0.8 : 1 }]}
-                          >
-                            <Text className={restGroupId === group.id ? 'font-semibold text-background text-sm' : 'font-medium text-foreground text-sm'}>
-                              {group.name}
-                            </Text>
-                            <Text className={`text-xs ${restGroupId === group.id ? 'text-background' : 'text-muted'}`}>
-                              Letzt.: {(lastSession.totalAmount || 0).toFixed(0)} kg
-                            </Text>
-                          </Pressable>
-                        );
-                      })}
-                  </View>
-                </ScrollView>
-              </View>
+                  ))}
+                </View>
+              </ScrollView>
 
               {restGroupId !== 'none' && (
-                <View className="gap-2">
-                  <View className="flex-row items-center gap-2 px-4 py-3 bg-surface rounded-lg border border-border" style={{ borderColor: colors.border }}>
-                    <TextInput
-                      className="flex-1 text-foreground text-lg font-semibold"
-                      placeholder="0"
-                      placeholderTextColor={colors.muted}
-                      keyboardType="decimal-pad"
-                      value={restAmount}
-                      onChangeText={setRestAmount}
-                    />
-                    <Text className="text-sm text-muted font-medium">kg</Text>
-                  </View>
-
-                  {restKg > 0 && prevSession && (
-                    <View className="p-3 bg-primary/10 rounded-lg border border-primary/20 gap-1">
-                      <Text className="text-xs font-semibold text-foreground">
-                        Geschätzte Zusammensetzung ({allGroups.find(g => g.id === restGroupId)?.name})
-                      </Text>
-                      {(() => {
-                        const prevActuals = prevSession.actualAmounts as Record<string, number>;
-                        const prevRestComps = (prevSession.restPerComponent || {}) as Record<string, number>;
-                        const prevTotalAmounts: Record<string, number> = {};
-                        for (const id of Object.keys(prevActuals)) {
-                          prevTotalAmounts[id] = (prevActuals[id] || 0) + (prevRestComps[id] || 0);
-                        }
-                        const prevGrandTotal = Object.values(prevTotalAmounts).reduce((a: number, b: number) => a + b, 0);
-                        return Object.entries(prevTotalAmounts).map(([id, val]) => {
-                          const restShare = prevGrandTotal > 0 ? restKg * (val / prevGrandTotal) : 0;
-                          if (restShare < 0.5) return null;
-                          return (
-                            <Text key={id} className="text-xs text-muted">{id}: {restShare.toFixed(0)} kg</Text>
-                          );
-                        });
-                      })()}
-                    </View>
-                  )}
+                <View className="flex-row items-center gap-2 px-4 py-3 bg-surface rounded-lg border border-border" style={{ borderColor: colors.border }}>
+                  <TextInput
+                    className="flex-1 text-foreground text-lg font-semibold"
+                    placeholder="0"
+                    placeholderTextColor={colors.muted}
+                    keyboardType="decimal-pad"
+                    value={restAmount}
+                    onChangeText={setRestAmount}
+                  />
+                  <Text className="text-sm text-muted font-medium">kg</Text>
                 </View>
               )}
             </View>
 
+            {/* Reihenfolge */}
             {orderedComponents.length > 0 && (
               <View className="gap-3">
                 <View className="flex-row justify-between items-center">
                   <Text className="text-sm font-semibold text-foreground">Ladereihenfolge</Text>
-                  <Text className="text-xs text-muted">wird automatisch gespeichert</Text>
+                  <Text className="text-xs text-muted">wird gespeichert</Text>
                 </View>
                 <View className="gap-2">
-                  {orderedComponents.map((comp, index) => (
-                    <View key={comp.id} className="flex-row items-center gap-2 p-3 bg-surface rounded-lg border border-border" style={{ borderColor: colors.border }}>
-                      <View className="w-6 h-6 rounded-full items-center justify-center" style={{ backgroundColor: colors.primary }}>
-                        <Text className="text-xs font-bold text-background">{index + 1}</Text>
+                  {orderedComponents.map((comp, index) => {
+                    const isLead = leadComponentIds.includes(comp.id);
+                    return (
+                      <View key={comp.id} className="flex-row items-center gap-2 p-3 bg-surface rounded-lg border" style={{ borderColor: isLead ? colors.primary : colors.border }}>
+                        <View className="w-6 h-6 rounded-full items-center justify-center" style={{ backgroundColor: isLead ? colors.primary : colors.border }}>
+                          <Text style={{ fontSize: 11, fontWeight: 'bold', color: isLead ? colors.background : colors.muted }}>{index + 1}</Text>
+                        </View>
+                        <Text className="flex-1 text-sm font-medium text-foreground">{comp.name}</Text>
+                        <Text className="text-xs mr-1" style={{ color: isLead ? colors.primary : colors.muted }}>
+                          {isLead ? '🎯' : '📊'}
+                        </Text>
+                        {currentRation && (
+                          <Text className="text-xs text-muted mr-2">{formatAmount(currentRation.components[comp.id] || 0)} kg</Text>
+                        )}
+                        <View className="flex-row gap-1">
+                          <Pressable onPress={() => moveComponent(index, 'up')} disabled={index === 0}
+                            style={({ pressed }) => [{ backgroundColor: index === 0 ? colors.surface : colors.primary, borderRadius: 4, width: 28, height: 28, alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.7 : 1 }]}>
+                            <Text style={{ color: index === 0 ? colors.muted : colors.background, fontSize: 14, fontWeight: 'bold' }}>↑</Text>
+                          </Pressable>
+                          <Pressable onPress={() => moveComponent(index, 'down')} disabled={index === orderedComponents.length - 1}
+                            style={({ pressed }) => [{ backgroundColor: index === orderedComponents.length - 1 ? colors.surface : colors.primary, borderRadius: 4, width: 28, height: 28, alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.7 : 1 }]}>
+                            <Text style={{ color: index === orderedComponents.length - 1 ? colors.muted : colors.background, fontSize: 14, fontWeight: 'bold' }}>↓</Text>
+                          </Pressable>
+                        </View>
                       </View>
-                      <Text className="flex-1 text-sm font-medium text-foreground">{comp.name}</Text>
-                      {currentRation && (
-                        <Text className="text-xs text-muted mr-2">{formatAmount(currentRation.components[comp.id] || 0)} kg</Text>
-                      )}
-                      <View className="flex-row gap-1">
-                        <Pressable onPress={() => moveComponent(index, 'up')} disabled={index === 0}
-                          style={({ pressed }) => [{ backgroundColor: index === 0 ? colors.surface : colors.primary, borderRadius: 4, width: 28, height: 28, alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.7 : 1 }]}>
-                          <Text style={{ color: index === 0 ? colors.muted : colors.background, fontSize: 14, fontWeight: 'bold' }}>↑</Text>
-                        </Pressable>
-                        <Pressable onPress={() => moveComponent(index, 'down')} disabled={index === orderedComponents.length - 1}
-                          style={({ pressed }) => [{ backgroundColor: index === orderedComponents.length - 1 ? colors.surface : colors.primary, borderRadius: 4, width: 28, height: 28, alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.7 : 1 }]}>
-                          <Text style={{ color: index === orderedComponents.length - 1 ? colors.muted : colors.background, fontSize: 14, fontWeight: 'bold' }}>↓</Text>
-                        </Pressable>
-                      </View>
-                    </View>
-                  ))}
+                    );
+                  })}
                 </View>
-              </View>
-            )}
-
-            {currentRation && orderedComponents.length > 0 && (
-              <View className="p-4 bg-primary/10 rounded-lg border border-primary/20 gap-2">
-                <Text className="text-xs font-semibold text-foreground uppercase">Grundration pro Tier</Text>
-                <Text className="text-sm text-foreground">
-                  Summe: <Text className="font-semibold">
-                    {formatAmount(calculateTotalRation(Object.fromEntries(orderedComponents.map((c) => [c.id, currentRation.components[c.id] || 0]))))} kg
-                  </Text>
-                </Text>
               </View>
             )}
 
@@ -481,6 +388,7 @@ export default function FeedingModeScreen() {
 
   const currentComponent = orderedComponents[completedComponents.length];
   const cumulativeTarget = currentComponent ? getCumulativeTarget(currentComponent.id) : 0;
+  const isCurrentLead = currentComponent ? leadComponentIds.includes(currentComponent.id) : false;
 
   return (
     <ScreenContainer className="p-6">
@@ -488,16 +396,13 @@ export default function FeedingModeScreen() {
         <View className="flex-1 gap-4">
           <View className="gap-1 mb-2">
             <Text className="text-2xl font-bold text-foreground">Fütterung läuft</Text>
-            <Text className="text-sm text-muted">
-              {selectedGroup?.name} • Ziel: {totalAmount} kg
-              {parseAmount(restAmount) > 0 ? ` (inkl. ${parseAmount(restAmount).toFixed(0)} kg Rest)` : ''}
-            </Text>
+            <Text className="text-sm text-muted">{selectedGroup?.name} • Ziel: {totalAmount} kg{parseAmount(restAmount) > 0 ? ` (inkl. ${parseAmount(restAmount).toFixed(0)} kg Rest)` : ''}</Text>
           </View>
 
           {parseAmount(restAmount) > 0 && (
             <View className="p-3 bg-primary/10 rounded-lg border border-primary/20">
               <Text className="text-xs font-semibold text-foreground">
-                ✓ {parseAmount(restAmount).toFixed(0)} kg Rest ({allGroups.find(g => g.id === restGroupId)?.name}) bereits eingerechnet – Waage startet bei {parseAmount(restAmount).toFixed(0)} kg
+                ✓ {parseAmount(restAmount).toFixed(0)} kg Rest ({allGroups.find(g => g.id === restGroupId)?.name}) eingerechnet
               </Text>
             </View>
           )}
@@ -513,22 +418,27 @@ export default function FeedingModeScreen() {
           </View>
 
           {currentComponent && (
-            <View className="p-4 rounded-lg border-2" style={{ borderColor: colors.primary, backgroundColor: colors.surface }}>
-              <Text className="text-xs font-semibold text-primary uppercase mb-3">Jetzt laden</Text>
+            <View className="p-4 rounded-lg border-2" style={{ borderColor: isCurrentLead ? colors.primary : colors.muted, backgroundColor: colors.surface }}>
+              <View className="flex-row items-center gap-2 mb-3">
+                <Text className="text-xs font-semibold uppercase" style={{ color: isCurrentLead ? colors.primary : colors.muted }}>
+                  {isCurrentLead ? '🎯 Leitkomponente – Jetzt laden' : '📊 Folgekomponente – Jetzt laden'}
+                </Text>
+              </View>
               <Text className="text-lg font-bold text-foreground mb-1">{currentComponent.name}</Text>
 
               <View className="gap-1 mb-3 p-3 bg-primary/10 rounded-lg">
                 {parseAmount(restAmount) > 0 && (
                   <View className="flex-row justify-between">
-                    <Text className="text-xs text-muted">Rest ({allGroups.find(g => g.id === restGroupId)?.name})</Text>
+                    <Text className="text-xs text-muted">Rest</Text>
                     <Text className="text-xs text-muted">{parseAmount(restAmount).toFixed(0)} kg ✓</Text>
                   </View>
                 )}
                 {completedComponents.map((id) => {
                   const comp = orderedComponents.find((c) => c.id === id);
+                  const isLead = leadComponentIds.includes(id);
                   return (
                     <View key={id} className="flex-row justify-between">
-                      <Text className="text-xs text-muted">{comp?.name}</Text>
+                      <Text className="text-xs text-muted">{isLead ? '🎯' : '📊'} {comp?.name}</Text>
                       <Text className="text-xs text-muted">{formatAmount(actualAmounts[id] || 0)} kg ✓</Text>
                     </View>
                   );
@@ -543,7 +453,7 @@ export default function FeedingModeScreen() {
                 </View>
               </View>
 
-              <View className="flex-row items-center gap-2 px-3 py-3 bg-background rounded-lg border" style={{ borderColor: colors.primary }}>
+              <View className="flex-row items-center gap-2 px-3 py-3 bg-background rounded-lg border" style={{ borderColor: isCurrentLead ? colors.primary : colors.muted }}>
                 <TextInput
                   className="flex-1 text-foreground text-xl font-bold"
                   placeholder={formatTarget(cumulativeTarget)}
@@ -554,10 +464,12 @@ export default function FeedingModeScreen() {
                 />
                 <Text className="text-base text-muted font-medium">kg</Text>
               </View>
-              <Text className="text-xs text-muted mt-1">Gib den aktuellen Waagenstand ein</Text>
+              <Text className="text-xs text-muted mt-1">
+                {isCurrentLead ? 'Leitkomponente – beeinflusst Tieranzahl' : 'Folgekomponente – beeinflusst Tieranzahl nicht'}
+              </Text>
 
               <Pressable onPress={() => handleComponentComplete(currentComponent.id)}
-                style={({ pressed }) => [{ backgroundColor: colors.primary, borderRadius: 8, padding: 14, marginTop: 12, opacity: pressed ? 0.8 : 1 }]}>
+                style={({ pressed }) => [{ backgroundColor: isCurrentLead ? colors.primary : colors.muted, borderRadius: 8, padding: 14, marginTop: 12, opacity: pressed ? 0.8 : 1 }]}>
                 <Text className="text-center font-semibold text-background text-base">Bestätigen</Text>
               </Pressable>
             </View>
@@ -571,10 +483,11 @@ export default function FeedingModeScreen() {
                 const planned = plannedAmounts[id] || 0;
                 const actual = actualAmounts[id] || 0;
                 const diff = actual - roundTo5(planned);
+                const isLead = leadComponentIds.includes(id);
                 return (
                   <View key={id} className="p-3 rounded-lg border" style={{ borderColor: colors.success, backgroundColor: colors.surface }}>
                     <View className="flex-row justify-between items-center">
-                      <Text className="text-sm font-semibold text-foreground">{comp?.name}</Text>
+                      <Text className="text-sm font-semibold text-foreground">{isLead ? '🎯' : '📊'} {comp?.name}</Text>
                       <Text className="text-xs font-semibold text-success">✓ Fertig</Text>
                     </View>
                     <View className="flex-row justify-between mt-1">
@@ -593,34 +506,30 @@ export default function FeedingModeScreen() {
           {completedComponents.length > 0 && completedComponents.length < orderedComponents.length && (
             <View className="gap-2">
               <Text className="text-xs font-semibold text-muted uppercase">Noch zu laden (aktualisiert)</Text>
-              {orderedComponents
-                .filter((c) => !completedComponents.includes(c.id) && c.id !== currentComponent?.id)
-                .map((comp) => (
+              {orderedComponents.filter((c) => !completedComponents.includes(c.id) && c.id !== currentComponent?.id).map((comp) => {
+                const isLead = leadComponentIds.includes(comp.id);
+                return (
                   <View key={comp.id} className="p-3 rounded-lg border" style={{ borderColor: colors.border, backgroundColor: colors.surface }}>
                     <View className="flex-row justify-between">
-                      <Text className="text-xs text-muted">{comp.name}</Text>
+                      <Text className="text-xs text-muted">{isLead ? '🎯' : '📊'} {comp.name}</Text>
                       <Text className="text-xs font-medium text-foreground">{formatTarget(plannedAmounts[comp.id] || 0)} kg</Text>
                     </View>
                   </View>
-                ))}
+                );
+              })}
             </View>
           )}
 
           {completedComponents.length === orderedComponents.length && (
             <View className="gap-3">
               <View className="p-4 bg-primary/10 rounded-lg border border-primary/20 gap-1">
-                <Text className="text-sm font-bold text-foreground text-center">
-                  Frisch geladen: {formatAmount(getCumulativeActual())} kg
-                </Text>
+                <Text className="text-sm font-bold text-foreground text-center">Frisch geladen: {formatAmount(getCumulativeActual())} kg</Text>
                 {parseAmount(restAmount) > 0 && (
-                  <Text className="text-xs text-muted text-center">
-                    Rest genutzt: {parseAmount(restAmount).toFixed(0)} kg ({allGroups.find(g => g.id === restGroupId)?.name})
-                  </Text>
+                  <Text className="text-xs text-muted text-center">Rest genutzt: {parseAmount(restAmount).toFixed(0)} kg</Text>
                 )}
                 <Text className="text-sm font-bold text-primary text-center">
                   Gesamt: {formatAmount(getCumulativeActual() + parseAmount(restAmount))} kg
                 </Text>
-                <Text className="text-xs text-muted text-center">Geplant: {totalAmount} kg</Text>
               </View>
               <Pressable onPress={handleSave} disabled={isSaving}
                 style={({ pressed }) => [{ backgroundColor: colors.success, borderRadius: 8, padding: 16, opacity: pressed || isSaving ? 0.8 : 1 }]}>
