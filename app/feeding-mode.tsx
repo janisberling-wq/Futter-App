@@ -113,8 +113,8 @@ export default function FeedingModeScreen() {
           if (logs.length > 0) lastSessions[group.id] = logs[0]; // already sorted desc
         }
         setLastSessionPerGroup(lastSessions);
-      } catch (error) {
-        Alert.alert('Fehler', 'Daten konnten nicht geladen werden');
+      } catch (error: any) {
+        Alert.alert('Fehler', `Fehler: ${error?.message || JSON.stringify(error)}`);
       } finally {
         setIsLoading(false);
       }
