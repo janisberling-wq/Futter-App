@@ -3,7 +3,10 @@ import { ScrollView, Text, View, TextInput, Pressable, Alert, Switch, ActivityIn
 import { ScreenContainer } from '@/components/screen-container';
 import { useColors } from '@/hooks/use-colors';
 import { useFocusEffect } from 'expo-router';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getFarmCode, getRations, getInventory, saveInventoryItem } from '@/lib/supabase-service';
+import { runMigration, isMigrationDone } from '@/lib/migration';
+import { FARM_CODE_KEY } from '@/lib/supabase-service';
 
 interface BestandEntry {
   id: string;
@@ -27,6 +30,8 @@ export default function BestandScreen() {
   const [thresholdValues, setThresholdValues] = useState<Record<string, string>>({});
   const [isSaving, setIsSaving] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const [isMigrating, setIsMigrating] = useState(false);
+  const [migrationProgress, setMigrationProgress] = useState('');
   const [farmCode, setFarmCode] = useState<string | null>(null);
 
   const loadData = async () => {
@@ -36,7 +41,6 @@ export default function BestandScreen() {
       setFarmCode(code);
       if (!code) return;
 
-      // Alle Komponenten aus allen Rationen sammeln
       const rations = await getRations(code);
       const nameMap: Record<string, string> = {};
       const allComponentIds = new Set<string>();
@@ -50,7 +54,6 @@ export default function BestandScreen() {
       });
 
       const existing = await getInventory(code);
-
       const merged: BestandEntry[] = Array.from(allComponentIds).map((id) => {
         if (existing[id]) return { ...existing[id], name: nameMap[id] || existing[id].name };
         return { id, name: nameMap[id] || id, tracked: false, currentStock: 0, warningEnabled: false, warningThreshold: 100 };
@@ -84,6 +87,47 @@ export default function BestandScreen() {
       Alert.alert('Erfolg', 'Bestand gespeichert');
     } catch { Alert.alert('Fehler', 'Bestand konnte nicht gespeichert werden'); }
     finally { setIsSaving(false); }
+  };
+
+  const handleMigration = async () => {
+    if (!farmCode) return;
+    Alert.alert(
+      'Alte Daten migrieren',
+      'Hiermit werden alle lokalen Protokolle, Bestände und Rationen aus der alten App-Version nach Supabase übertragen. Fortfahren?',
+      [
+        { text: 'Abbrechen', style: 'cancel' },
+        { text: 'Migrieren', onPress: async () => {
+          setIsMigrating(true);
+          try {
+            // Migration-Flag zurücksetzen damit sie erneut läuft
+            await AsyncStorage.removeItem('app:migration_done');
+            const { logs, inventory } = await runMigration(farmCode, setMigrationProgress);
+            Alert.alert('✅ Migration abgeschlossen', `${logs} Protokolleinträge und ${inventory} Bestandseinträge wurden übertragen.`);
+            await loadData();
+          } catch (e: any) {
+            Alert.alert('Fehler', `Migration fehlgeschlagen: ${e?.message}`);
+          } finally {
+            setIsMigrating(false);
+            setMigrationProgress('');
+          }
+        }},
+      ]
+    );
+  };
+
+  const handleSwitchFarm = () => {
+    Alert.alert(
+      'Betrieb wechseln',
+      'Möchtest du den Betrieb wechseln? Du wirst zum Setup-Screen weitergeleitet.',
+      [
+        { text: 'Abbrechen', style: 'cancel' },
+        { text: 'Wechseln', style: 'destructive', onPress: async () => {
+          await AsyncStorage.removeItem(FARM_CODE_KEY);
+          // App neu starten durch State-Reset
+          Alert.alert('Betrieb gewechselt', 'Bitte starte die App neu um den Setup-Screen zu sehen.');
+        }},
+      ]
+    );
   };
 
   const toggleTracked = (id: string) => setEntries((prev) => prev.map((e) => e.id === id ? { ...e, tracked: !e.tracked } : e));
@@ -185,6 +229,30 @@ export default function BestandScreen() {
 
           <View className="p-4 bg-primary/10 rounded-lg border border-primary/20">
             <Text className="text-xs text-foreground font-medium">💡 Nur verfolgte Komponenten werden nach jeder Fütterung automatisch abgezogen.</Text>
+          </View>
+
+          {/* Einstellungen */}
+          <View className="gap-3 mt-4">
+            <Text className="text-xs font-semibold text-muted uppercase">Einstellungen</Text>
+
+            {isMigrating ? (
+              <View className="p-4 bg-surface rounded-lg border border-border gap-2 items-center">
+                <ActivityIndicator color={colors.primary} />
+                <Text className="text-xs text-muted text-center">{migrationProgress || 'Migriere...'}</Text>
+              </View>
+            ) : (
+              <Pressable onPress={handleMigration}
+                style={({ pressed }) => [{ backgroundColor: colors.surface, borderColor: colors.primary, borderWidth: 1, borderRadius: 8, padding: 14, opacity: pressed ? 0.8 : 1 }]}>
+                <Text className="text-center font-semibold text-primary">🔄 Alte Daten migrieren</Text>
+                <Text className="text-center text-xs text-muted mt-1">Protokolle und Bestand aus alter Version übertragen</Text>
+              </Pressable>
+            )}
+
+            <Pressable onPress={handleSwitchFarm}
+              style={({ pressed }) => [{ backgroundColor: colors.surface, borderColor: '#ef4444', borderWidth: 1, borderRadius: 8, padding: 14, opacity: pressed ? 0.8 : 1 }]}>
+              <Text className="text-center font-semibold" style={{ color: '#ef4444' }}>🔑 Betrieb wechseln</Text>
+              <Text className="text-center text-xs text-muted mt-1">Zu einem anderen Betrieb wechseln</Text>
+            </Pressable>
           </View>
         </View>
       </ScrollView>
